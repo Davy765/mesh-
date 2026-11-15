@@ -1,7 +1,7 @@
 """A small replicated ledger: the rulebook and the bank. It never runs the model.
 
-Validators each keep their own copy of the state. A block counts only if at least 2f+1 of the
-3f+1 validators re-executed it independently and signed the same resulting state, so one
+Validators each keep their own copy of the state. A block counts only if at least n-f of the
+n >= 3f+1 validators re-executed it independently and signed the same resulting state, so one
 dishonest validator can neither forge balances nor stall the chain (the next proposer takes over).
 
 Everything heavy (activations, weights, updates) stays off-chain. The chain only stores:
@@ -51,6 +51,15 @@ class State:
         self.evidence_seen = []
         self.jobs = {}
         self.events = []
+
+    @classmethod
+    def from_obj(cls, obj, genesis, events=()):
+        """Rebuild a state received over the network (the caller has checked its hash)."""
+        s = cls(genesis)
+        for k, v in obj.items():
+            setattr(s, k, v)
+        s.events = list(events)
+        return s
 
     @staticmethod
     def _fresh_round():
@@ -112,7 +121,8 @@ class State:
         self.balances[s] -= stake
         self.stakes[s] = stake
         self.nodes[s] = {"role": role, "piece": piece, "sign_pk": b["sign_pk"], "kex_pk": b["kex_pk"],
-                         "rep": 10, "active": True, "name": str(b.get("name", ""))[:32]}
+                         "rep": 10, "active": True, "name": str(b.get("name", ""))[:32],
+                         "endpoint": str(b.get("endpoint", ""))[:100]}
         self.log(f"{b.get('name', s[:8])} registered as {role} for {piece}, stake {stake}")
 
     def _member_check(self, s, piece, rnd, phase):
@@ -334,27 +344,37 @@ class Validator:
         block["hash"] = sha(canon(block))
         return block
 
-    def check(self, block):
-        """Re-execute the block independently; sign only if we reach the same state."""
+    def _verify_exec(self, block):
+        """Check a block extends my chain and re-execute it. Returns (new state, results) or None."""
         if block["height"] != self.state.height or \
                 block["prev"] != (self.blocks[-1]["hash"] if self.blocks else "genesis"):
             return None
-        body = {k: v for k, v in block.items() if k != "hash"}
+        body = {k: v for k, v in block.items() if k not in ("hash", "sigs", "results")}
         if sha(canon(body)) != block["hash"] or merkle_root([tx_hash(t) for t in block["txs"]]) != block["tx_root"]:
             return None
         s, results = self._execute(block["txs"])
-        if s.root() != block["state_root"]:
+        return (s, results) if s.root() == block["state_root"] else None
+
+    def check(self, block):
+        """Re-execute the block independently; sign only if we reach the same state."""
+        r = self._verify_exec(block)
+        if r is None:
             return None
-        self._pending[block["hash"]] = (s, results)
+        self._pending[block["hash"]] = r
         return self.id.sign(bytes.fromhex(block["hash"]))
 
     def commit(self, block, sigs, validator_keys, quorum):
+        """Adopt a block that a quorum signed (also used to catch up on blocks I missed)."""
         good = {a for a, sig in sigs.items()
                 if a in validator_keys and verify(validator_keys[a], sig, bytes.fromhex(block["hash"]))}
-        if len(good) < quorum or block["hash"] not in self._pending:
+        if len(good) < quorum:
             return False
-        self.state, results = self._pending.pop(block["hash"])
+        r = self._pending.pop(block["hash"], None) or self._verify_exec(block)
+        if r is None:
+            return False
+        self.state, results = r
         self._pending.clear()
+        block = {k: v for k, v in block.items() if k not in ("sigs", "results")}
         self.blocks.append({**block, "sigs": sigs, "results": results})
         included = {tx_hash(t) for t in block["txs"]}
         self.mempool = [t for t in self.mempool if tx_hash(t) not in included]
@@ -368,7 +388,7 @@ class Chain:
         self.validators = [Validator(v, genesis, corrupt=v.address in corrupt) for v in validator_ids]
         self.keys = {v.address: v.id.sign_pk for v in self.validators}
         n = len(self.validators)
-        self.quorum = 2 * ((n - 1) // 3) + 1
+        self.quorum = n - (n - 1) // 3          # tolerates f = (n-1)//3 faulty validators
         self.rejected_proposals = 0
 
     @property

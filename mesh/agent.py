@@ -1,6 +1,8 @@
 """An agent: owns private data, holds the model's ends, uses (and pays for) the slice servers,
 trains the shared model, votes on updates, and trades work with other agents.
 """
+import time
+
 import numpy as np
 
 from .aggregate import clip
@@ -68,9 +70,18 @@ class Agent(PieceMember):
 
     def run_hop(self, piece, kind, version, arrays, train=False, route="fast"):
         """One hop through a slice, with failover and random spot checks. Returns (output, ms)."""
-        ms_total, tried = 0.0, set()
-        for _ in range(4):
-            addr = self.choose(piece, exclude=tried, route=route)
+        ms_total, tried, sweeps = 0.0, set(), 0
+        for _ in range(8):
+            try:
+                addr = self.choose(piece, exclude=tried, route=route)
+            except NodeDown:
+                if sweeps or not tried:            # already retried once, or nobody to ask at all
+                    raise
+                sweeps += 1                        # every replica refused: maybe they're still switching
+                time.sleep(0.25)                   # to this round's weights. Wait briefly, try again.
+                ms_total += 250
+                tried = set()
+                continue
             tried.add(addr)
             try:
                 out, rc, ms = self._call(addr, kind, version, arrays, train)
@@ -90,7 +101,7 @@ class Agent(PieceMember):
             self.stats[f"hops_{route}"] += 1
             self.stats[f"ms_{route}"] += ms
             return out, ms_total
-        raise NodeDown(f"no working replica for {piece}")
+        raise NodeDown(f"no working replica for {piece}")  # pragma: no cover
 
     def spot_check_hop(self, piece, kind, version, arrays, addr, out, rc):
         """Ask other replicas to redo the same computation. If two of them agree on a different

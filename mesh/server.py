@@ -30,6 +30,10 @@ class SliceServer(PieceMember):
         return out
 
     def handle(self, kind, sender, meta, arrays):
+        with self.lock:
+            return self._handle(kind, sender, meta, arrays)
+
+    def _handle(self, kind, sender, meta, arrays):
         r = self.handle_member(kind, sender, meta, arrays)
         if r is not None:
             return r

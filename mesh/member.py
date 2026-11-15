@@ -9,6 +9,7 @@
 """
 import math
 import os
+import threading
 
 import numpy as np
 
@@ -34,6 +35,8 @@ class PieceMember(Peer):
             raise ValueError("my initial weights do not match genesis")
         self.cand, self.cand_hash = None, None
         self.nonce = 0
+        self.lock = threading.RLock()        # requests arrive on other threads when on a real network
+        self._at_round = chain.state.round
         self._reset_round()
 
     # ---- chain helpers ----------------------------------------------------------
@@ -41,9 +44,9 @@ class PieceMember(Peer):
         self.chain.submit(make_tx(self.id, kind, body, self.nonce))
         self.nonce += 1
 
-    def register(self, role, stake):
+    def register(self, role, stake, endpoint=""):
         self.submit("register", {"role": role, "piece": self.piece, "stake": stake, "name": self.name,
-                                 "sign_pk": self.id.sign_pk, "kex_pk": self.id.kex_pk})
+                                 "sign_pk": self.id.sign_pk, "kex_pk": self.id.kex_pk, "endpoint": endpoint})
 
     @property
     def active(self):
@@ -61,9 +64,10 @@ class PieceMember(Peer):
 
     def add_contribution(self, grads):
         """grads must already be clipped to self.C."""
-        for k in self.acc:
-            self.acc[k] += grads[k]
-        self.n_contrib += 1
+        with self.lock:
+            for k in self.acc:
+                self.acc[k] += grads[k]
+            self.n_contrib += 1
 
     def _n_params(self):
         return sum(v.size for v in self.params.values())
@@ -79,9 +83,10 @@ class PieceMember(Peer):
 
     # ---- round phases ------------------------------------------------------------
     def phase_commit(self):
-        if not self.active or not self.online or self.n_contrib == 0:
-            return
-        mean = dp_release(self.acc, self.n_contrib, self.C, self.sigma, self.rng)
+        with self.lock:
+            if not self.active or not self.online or self.n_contrib == 0:
+                return
+            mean = dp_release(self.acc, self.n_contrib, self.C, self.sigma, self.rng)
         self.update = {k: -self.current_lr() * v for k, v in mean.items()}
         if self.behaviour == "poisoner":                       # push the model the wrong way, hard
             self.update = {k: -50 * v for k, v in self.update.items()}
@@ -105,16 +110,18 @@ class PieceMember(Peer):
             return
         st = self.chain.state
         commits = st.cur["commits"].get(self.piece, {})
-        valid = sorted(a for a, (u, salt) in self.reveals.items()
+        with self.lock:
+            reveals = dict(self.reveals)
+        valid = sorted(a for a, (u, salt) in reveals.items()
                        if a in commits and commits[a] == sha(param_hash(u), salt))
         if not valid:
             return
-        agg, kept_idx = robust_aggregate([self.reveals[a][0] for a in valid], [1.0] * len(valid),
+        agg, kept_idx = robust_aggregate([reveals[a][0] for a in valid], [1.0] * len(valid),
                                          self.max_update_norm())
         kept = [valid[i] for i in kept_idx]
         if self.behaviour == "poisoner" and self.address in valid and self.address not in kept:
             kept.append(self.address)                     # claims its update should count
-            agg = {k: agg[k] + self.reveals[self.address][0][k] for k in agg}
+            agg = {k: agg[k] + reveals[self.address][0][k] for k in agg}
         self.cand = {k: self.params[k] + agg[k] for k in self.params}
         self.cand_hash = param_hash(self.cand)
         self.submit("candidate", {"round": st.round, "piece": self.piece, "digest": self.cand_hash,
@@ -122,13 +129,23 @@ class PieceMember(Peer):
 
     def phase_finalize(self):
         """Called after the vote block: adopt whatever the chain now says is canonical."""
-        target = self.chain.state.canonical[self.piece]
-        if target == self.cand_hash:
-            self.params, self.version = self.cand, self.cand_hash
-        elif target != self.version and self.online:
+        self.catch_up(allow_resync=True)
+
+    def catch_up(self, allow_resync=False):
+        """Move to the new round once (whether my own loop or an early request notices first).
+        Adopt the agreed weights if I computed them; otherwise download them (only from my own loop,
+        never while answering a request, so two servers can't wait on each other)."""
+        st = self.chain.state
+        target = st.canonical[self.piece]
+        with self.lock:
+            if self._at_round != st.round:
+                self._at_round = st.round
+                if target == self.cand_hash:
+                    self.params, self.version = self.cand, self.cand_hash
+                self.cand, self.cand_hash = None, None
+                self._reset_round()
+        if allow_resync and target != self.version and self.online:
             self.resync(target)
-        self.cand, self.cand_hash = None, None
-        self._reset_round()
 
     def fetch_verified(self, target):
         """Download a version of my piece from a peer; never trust it, always check the hash."""
@@ -144,14 +161,19 @@ class PieceMember(Peer):
     def resync(self, target):
         p = self.fetch_verified(target)
         if p is not None:
-            self.params, self.version = p, target
+            with self.lock:
+                self.params, self.version = p, target
             self.resyncs = getattr(self, "resyncs", 0) + 1
 
     def params_for(self, version):
-        if version == self.version:
-            return self.params
-        if self.cand_hash and version == self.cand_hash:
-            return self.cand
+        for attempt in range(2):
+            if version == self.version:
+                return self.params
+            if self.cand_hash and version == self.cand_hash:
+                return self.cand
+            if attempt == 0:                     # maybe a new round started and I haven't noticed yet
+                getattr(self.chain, "refresh", lambda: None)()
+                self.catch_up()
         raise Rejected("I don't hold that version")
 
     # ---- requests every member answers --------------------------------------------------
@@ -160,10 +182,12 @@ class PieceMember(Peer):
         if kind == "reveal":
             if sender not in st.members(self.piece) or meta["round"] != st.round:
                 raise Rejected("not a holder of this piece")
-            self.reveals[sender] = ({k: np.asarray(v, float) for k, v in arrays.items()}, meta["salt"])
+            with self.lock:
+                self.reveals[sender] = ({k: np.asarray(v, float) for k, v in arrays.items()}, meta["salt"])
             return {}, {}, 1.0
         if kind == "fetch":
             if sender not in st.members(self.piece):
                 raise Rejected("not a holder of this piece")
-            return {}, self.params_for(meta["version"]), 5.0
+            with self.lock:
+                return {}, self.params_for(meta["version"]), 5.0
         return None

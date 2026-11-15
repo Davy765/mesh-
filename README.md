@@ -70,10 +70,32 @@ Tests: `python -m unittest discover -s tests` (16 tests, about 15 s).
 Each agent alone (only 2 of the 4 classes) gets about 49%. Smaller ε means stronger privacy; useful values are under 10.
 Getting there without losing accuracy takes thousands of participants, not 5.
 
+### Running it as real, separate programs
+
+```bash
+python -m mesh.run local --rounds 40        # 21 OS processes on this machine, talking over TCP
+python -m mesh.run init --dir net --host <ip>   # or: write a config, copy it to several machines,
+python -m mesh.run node --dir net --name agent2 #     and start each node where you like
+```
+
+Each validator, server and agent is its own process listening on its own port. Validators take turns proposing
+in fixed time slots, and a dead or forging proposer just loses its slot. Servers and agents read the chain like a
+light client: they trust a state hash only if enough validators report it, then check the downloaded state
+against that hash.
+
+In a test run (40 rounds, 7 validators, about 5 minutes), test accuracy reached 89.7%:
+- one server and one honest validator were killed with SIGKILL halfway through, and the network kept going
+- the forging validator had all 24 of its blocks refused
+- a hop took 3.2 ms over local sockets
+- no node errors were logged
+
+**Demo shortcut:** `init` writes every node's key seed into `nodes.json`. In real use, each machine should make its
+own key and share only the public part.
+
 ### Not built yet
 
-Real networking (it runs in one process, with a simulated network of realistic latency), validators joining or
-leaving (the set is fixed at genesis) and full BFT consensus, light clients, defences against a majority of one
+Validators joining or
+leaving (the set is fixed at genesis) and full BFT consensus, defences against a majority of one
 slice's replicas colluding or against withholding reveals from some peers, and large models.
 
 ### Code map
