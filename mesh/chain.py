@@ -63,7 +63,7 @@ class State:
 
     @staticmethod
     def _fresh_round():
-        return {"commits": {}, "candidates": {}, "chosen": {}, "votes": {}, "work": {}}
+        return {"commits": {}, "candidates": {}, "chosen": {}, "votes": {}, "work": {}, "contribs": {}}
 
     def copy(self):
         return copy.deepcopy(self)
@@ -137,6 +137,20 @@ class State:
         if err:
             return err
         self.cur["commits"].setdefault(b["piece"], {})[s] = str(b["digest"])
+
+    def _tx_contrib(self, s, b):
+        """An agent declares the fingerprint of the training data it sent to each slice this round.
+        Every replica of that slice must compute its update from exactly these inputs."""
+        n = self.nodes.get(s)
+        if not n or not n["active"] or n["role"] != "client":
+            return "only active agents"
+        if b["round"] != self.round or self.phase != "commit":
+            return f"wrong round/phase (now round {self.round} {self.phase})"
+        inputs = {str(p): str(h) for p, h in b["inputs"].items()}
+        if any(p not in self.canonical or p == "ends" for p in inputs):
+            return "bad piece"
+        for p, h in inputs.items():
+            self.cur["contribs"].setdefault(p, {})[s] = h
 
     def _tx_candidate(self, s, b):
         err = self._member_check(s, b["piece"], b["round"], "reveal")
@@ -292,26 +306,38 @@ class State:
         if not self.cur["commits"]:
             return
         pieces = list(self.canonical)
-        # Each agent reports how the candidate changed ITS held-out loss. Agents hold different data,
-        # so judge the network-wide effect: trimmed mean (ignore the most extreme reports) of all reports.
+        # Each agent reports the relative change of ITS held-out loss under the candidate. Agents hold
+        # different data, so judge the network-wide effect: trimmed mean (ignore the most extreme reports).
+        # Ordinary training steps often raise the loss a little and still make progress overall, so only a
+        # clearly harmful round (more than accept_tol worse) is rejected.
         deltas = sorted(v for a, v in self.cur["votes"].items() if a in self.members("ends"))
         cut = len(deltas) // 5 if len(deltas) >= 5 else 0
         mid = deltas[cut:len(deltas) - cut]
         score = sum(mid) / len(mid) if mid else float("inf")
         enough = len(deltas) * 2 > len(self.members("ends"))
         accepted = all(p in self.cur["chosen"] for p in pieces) and enough and score <= self.params["accept_tol"]
-        self.lr_scale = min(1.0, self.lr_scale * 2) if accepted else max(1 / 64, self.lr_scale / 2)
-        outcome = {"round": self.round, "accepted": accepted, "loss_change": round(score, 6),
-                   "trimmed": {p: sorted(set(self.cur["commits"].get(p, {})) - set(self.cur["chosen"][p][1]))
-                               for p in pieces if p in self.cur["chosen"]}}
+        up, down = self.params.get("lr_up", 2.0), self.params.get("lr_down", 0.5)
+        self.lr_scale = min(1.0, self.lr_scale * up) if accepted else max(1 / 64, self.lr_scale * down)
+        def agreeing(p):     # slice servers whose candidate matched the majority's
+            return [a for a, (d, _) in self.cur["candidates"].get(p, {}).items() if d == self.cur["chosen"][p][0]]
+
+        trimmed = {}
+        for p in pieces:
+            if p not in self.cur["chosen"]:
+                continue
+            if p == "ends":      # agents' own updates: those the poison-resistant average left out
+                trimmed[p] = sorted(set(self.cur["commits"].get(p, {})) - set(self.cur["chosen"][p][1]))
+            else:                # servers whose computed update disagreed with the majority
+                trimmed[p] = sorted(set(self.cur["candidates"].get(p, {})) - set(agreeing(p)))
+        outcome = {"round": self.round, "accepted": accepted, "loss_change": round(score, 6), "trimmed": trimmed}
         if accepted:
             for p in pieces:
                 self.canonical[p] = self.cur["chosen"][p][0]
                 if p == "ends":
                     continue
-                kept = [a for a in self.cur["chosen"][p][1] if self.cur["work"].get(a, 0) > 0]
+                kept = [a for a in agreeing(p) if self.cur["work"].get(a, 0) > 0]
                 total = sum(self.cur["work"][a] for a in kept)
-                for a in kept:            # training reward: only for kept updates, in proportion to paid work
+                for a in kept:            # training reward: only for servers that computed the agreed update
                     self.balances[a] = self.balances.get(a, 0) + \
                         self.params["emission"] * self.cur["work"][a] // total
                     self.nodes[a]["rep"] += 1

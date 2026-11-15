@@ -5,11 +5,12 @@ import time
 
 import numpy as np
 
-from .aggregate import clip
+from .aggregate import clip, cosine
 from .crypto import canon, merkle_root, sha, verify_obj
 from .member import PieceMember
 from .model import embed, embed_grads, head, loss_and_head_grads, output_hash
 from .network import NodeDown, Rejected
+from .server import input_fingerprint
 
 
 def pipeline_makespan(times):
@@ -24,11 +25,12 @@ def pipeline_makespan(times):
 
 class Agent(PieceMember):
     def __init__(self, identity, name, spec, chain, X, y, *, spot_check=0.15, activation_noise=0.0,
-                 batch=64, val_frac=0.2, max_val=500, **kw):
+                 batch=64, val_frac=0.2, max_val=500, seed_set=None, **kw):
         super().__init__(identity, name, "ends", spec, chain, **kw)
         n_val = min(int(len(X) * val_frac), max_val)   # held-out check set, kept small: it crosses the network
         self.Xval, self.yval, self.Xtr, self.ytr = X[:n_val], y[:n_val], X[n_val:], y[n_val:]
         self.spot_check, self.activation_noise, self.batch = spot_check, activation_noise, batch
+        self.seed_set = seed_set           # small public labelled set, fixed at genesis (or None)
         self.ewma, self.blocked = {}, set()
         self.work, self.receipts = {}, []
         self.stats = {"hops_fast": 0, "ms_fast": 0.0, "hops_spread": 0, "ms_spread": 0.0,
@@ -148,10 +150,10 @@ class Agent(PieceMember):
     def model_version(self):
         return sha(canon(self.versions("current")))
 
-    def forward(self, X, versions, route="fast"):
+    def forward(self, X, versions, route="fast", private=True):
         ends = self.params_for(versions["ends"])
         h0, z0 = embed(ends, X)
-        if self.activation_noise:                  # servers only ever see noised hidden features
+        if self.activation_noise and private:      # servers only ever see noised hidden features
             h0 = h0 + self.rng.normal(0, self.activation_noise, h0.shape)
         hs, hop_ms = [h0], []
         for i in range(self.spec.n_slices):
@@ -188,9 +190,45 @@ class Agent(PieceMember):
         xb, yb = self.Xtr[idx], self.ytr[idx]
         hs, z0, _, ends = self.forward(xb, v, route="spread")
         self.last_loss, _, g_head, g = loss_and_head_grads(ends, hs[-1], yb)
+        self.round_inputs = {}
         for i in reversed(range(self.spec.n_slices)):
-            g, _ = self.run_hop(f"slice{i}", "bwd", v[f"slice{i}"], {"h": hs[i], "g": g}, train=True, route="spread")
+            g = self.train_hop(f"slice{i}", v[f"slice{i}"], hs[i], g)
         self.add_contribution(clip({**g_head, **embed_grads(xb, z0, g)}, self.C))
+        self.submit("contrib", {"round": self.chain.state.round,
+                                "inputs": {p: input_fingerprint(h, gg) for p, (h, gg) in self.round_inputs.items()}})
+
+    def train_hop(self, piece, version, h, g):
+        """Send this training step to EVERY replica of the slice. They all record my contribution (so they
+        can all compute the same update) and all return the gradient, so every training hop is fully
+        cross-checked: a replica that disagrees with two others is proven wrong on the spot."""
+        self.round_inputs[piece] = (h, g)
+        answers, slowest = [], 0.0
+        for addr in self.chain.state.members(piece):
+            try:
+                out, rc, ms = self._call(addr, "bwd", version, {"h": h, "g": g}, train=True)
+            except (NodeDown, Rejected):
+                self.stats["failovers"] += 1
+                continue
+            self._pay(addr, rc)
+            answers.append((addr, out, rc))
+            slowest = max(slowest, ms)                 # the calls could go out in parallel
+        if not answers:
+            raise NodeDown(f"no working replica for {piece}")
+        groups = {}
+        for a in answers:
+            groups.setdefault(a[2]["body"]["output"], []).append(a)
+        best = max(groups.values(), key=len)
+        if len(best) >= 2:
+            for addr, _, rc in answers:
+                if rc["body"]["output"] != best[0][2]["body"]["output"] and addr not in self.blocked:
+                    self.blocked.add(addr)
+                    self.work[addr] -= 1
+                    self.stats["caught"] += 1
+                    self.submit("slash", {"evidence": {"accused": rc, "witnesses": [best[0][2], best[1][2]]}})
+        self.stats["checks"] += len(answers) > 1
+        self.stats["hops_spread"] += 1
+        self.stats["ms_spread"] += slowest
+        return best[0][1]
 
     def phase_vote(self):
         if not self.active or not self.online:
@@ -205,7 +243,8 @@ class Agent(PieceMember):
                     self.cand, self.cand_hash = p, cand["ends"]
             if self.cand_hash == cand["ends"]:
                 try:
-                    delta = self.val_loss(cand) - self.val_loss(self.versions())
+                    cur = self.val_loss(self.versions())
+                    delta = (self.val_loss(cand) - cur) / max(cur, 1e-6)   # relative change: +0.3 = 30% worse
                 except NodeDown:
                     pass
         if self.behaviour == "poisoner":
@@ -214,6 +253,22 @@ class Agent(PieceMember):
         self.submit("settle", {"round": st.round, "pay": dict(self.work),
                                "receipts_root": merkle_root(self.receipts)})
         self.work, self.receipts = {}, []
+
+    def trust_scores(self, updates):
+        """How far each agent's update points the same way as a training step on the public seed set.
+        Only the output layer is compared: it is where each class has its own weights, so an update that
+        un-learns some classes points clearly against the seed-set step."""
+        if self.seed_set is None:
+            return None
+        Xs, ys = self.seed_set
+        try:
+            # public data, so no privacy noise: every agent must get exactly the same trust scores
+            hs, _, _, ends = self.forward(Xs, self.versions(), private=False)
+        except NodeDown:
+            return None
+        _, _, g_head, _ = loss_and_head_grads(ends, hs[-1], ys)
+        ref = -np.concatenate([g_head["W_out"].ravel(), g_head["b_out"].ravel()])
+        return [max(0.0, cosine(np.concatenate([u["W_out"].ravel(), u["b_out"].ravel()]), ref)) for u in updates]
 
     # ---- job market ------------------------------------------------------------------------
     def claim_receipt(self, job, chunk, input_hash, labels):
@@ -276,8 +331,16 @@ class Agent(PieceMember):
             return r
         st = self.chain.state
         node = st.nodes.get(sender)
-        if not node or not node["active"] or node["role"] != "client":
+        if kind == "contrib_data" and node and node["active"] and node["role"] == "server":
+            pass
+        elif not node or not node["active"] or node["role"] != "client":
             raise Rejected("only registered agents")
+        if kind == "contrib_data":            # a replica missed my training input: it can have it
+            if sender not in st.members(meta["piece"]) or meta["round"] != st.round \
+                    or meta["piece"] not in getattr(self, "round_inputs", {}):
+                raise Rejected("not yours")
+            h, g = self.round_inputs[meta["piece"]]
+            return {}, {"h": h, "g": g}, 1.0
         if kind == "job_data":
             j = st.jobs.get(meta["job"])
             if not j or j["poster"] != self.address or j["chunks"][meta["chunk"]]["worker"] != sender:

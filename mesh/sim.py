@@ -11,6 +11,12 @@ from .network import SimNetwork
 from .server import SliceServer
 
 
+def public_seed_set(X, y, per_class=20):
+    """A small labelled set everyone agrees on at genesis (the first `per_class` examples of each class)."""
+    idx = np.concatenate([np.where(y == c)[0][:per_class] for c in range(int(y.max()) + 1)])
+    return X[idx], y[idx]
+
+
 def load_task(dataset, n_agents, seed=0):
     """Returns (spec, Xtrain, ytrain, Xtest, ytest, per-agent shards, learning rate)."""
     if dataset == "mnist":
@@ -25,11 +31,13 @@ def load_task(dataset, n_agents, seed=0):
 
 class World:
     def __init__(self, n_agents=5, replicas=3, adversaries=True, dp_sigma=0.0, activation_noise=0.0,
-                 spot_check=0.15, lr=None, clip_norm=2.0, seed=0, dataset="ring"):
+                 spot_check=0.15, lr=None, clip_norm=2.0, seed=0, dataset="ring", accept_tol=0.25,
+                 lr_down=0.5, lr_up=2.0, seed_set=True):
         self.spec, X, y, self.Xtest, self.ytest, shards, default_lr = load_task(dataset, n_agents, seed)
         spec = self.spec
         lr = default_lr if lr is None else lr
         rng = np.random.default_rng(seed)
+        self.seed_set = public_seed_set(X, y) if seed_set else None
 
         v_ids = [Identity(f"validator-{i}-{seed}") for i in range(4)]
         s_ids = {(i, r): Identity(f"server-{i}-{r}-{seed}") for i in range(spec.n_slices) for r in range(replicas)}
@@ -39,7 +47,7 @@ class World:
             "piece_hashes": {p: param_hash(init_piece(spec, p)) for p in spec.pieces},
             "balances": {**{i.address: 400 for i in s_ids.values()}, **{i.address: 20000 for i in a_ids}},
             "params": {"min_stake": 100, "price": 1, "slash_fraction": 0.5, "whistleblower_share": 0.2,
-                       "emission": 30, "accept_tol": 0.01},
+                       "emission": 30, "accept_tol": accept_tol, "lr_down": lr_down, "lr_up": lr_up},
         }
         self.corrupt_validator = v_ids[1].address if adversaries else None
         self.chain = Chain(genesis, v_ids, corrupt={self.corrupt_validator} if adversaries else set())
@@ -68,6 +76,7 @@ class World:
             self.agents.append(Agent(ident, f"agent{k}" + ("(cheater)" if behaviour != "honest" else ""), spec,
                                      self.chain, Xs[perm], ys[perm], behaviour=behaviour, spot_check=spot_check,
                                      activation_noise=activation_noise, latency_ms=float(rng.uniform(10, 60)),
+                                     seed_set=self.seed_set,
                                      seed=seed * 1000 + k, **common))
         for m in self.members:
             self.net.attach(m)
@@ -107,6 +116,14 @@ class World:
             if m.version == canon[m.piece]:
                 pieces[m.piece] = m.params
         return pieces
+
+    def per_class_accuracy(self):
+        p = self.canonical_model()
+        h, _ = embed(p["ends"], self.Xtest)
+        for i in range(self.spec.n_slices):
+            h = slice_forward(p[f"slice{i}"], h)
+        pred = head(p["ends"], h).argmax(1)
+        return [float((pred[self.ytest == c] == c).mean()) for c in range(self.spec.n_classes)]
 
     def accuracy(self, n=None):
         p = self.canonical_model()

@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .chain import State, Validator
 from .crypto import canon, sha
 from .network import NodeDown, Peer, Rejected
-from .transport import TCPNetwork, parse_endpoint, public_request, serve
+from .transport import TCPNetwork, public_request, serve
 
 
 def validator_directory(genesis):

@@ -66,6 +66,12 @@ def main():
 
     train_s = time.time() - t_train
     print(f"  final accuracy on all {len(w.ytest):,} test examples: {w.accuracy():.1%}")
+    per = w.per_class_accuracy()
+    print("  per class: " + "  ".join(f"{c}:{v:.0%}" for c, v in enumerate(per)))
+    if not a.no_attackers:
+        cheat = next(x for x in w.agents if x.behaviour != "honest")
+        own = sorted(set(cheat.ytr.tolist()))
+        print(f"  (classes {own} exist only in {cheat.name}'s private data; when it poisons, nobody can teach them)")
     print(f"  {train_s / a.rounds:.2f} s of computer time per round; "
           f"{w.net.bytes_sent / a.rounds / 1e6:.0f} MB of encrypted traffic per round")
     st = w.chain.state
@@ -78,7 +84,7 @@ def main():
         for p, addrs in h["trimmed"].items():
             for x in addrs:
                 trimmed[st.nodes[x]["name"]] = trimmed.get(st.nodes[x]["name"], 0) + 1
-    print(f"  updates thrown out as outliers: {trimmed or 'none'}")
+    print(f"  updates excluded (servers outvoted / agents' updates given zero trust): {trimmed or 'none'}")
     liar = next((s for s in w.servers.values() if s.behaviour == "liar"), None)
     if liar:
         print(f"  {liar.name}: stake {st.stakes[liar.address]}, reputation {st.nodes[liar.address]['rep']}, "

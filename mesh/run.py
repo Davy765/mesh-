@@ -63,7 +63,7 @@ def init(d, n_agents=5, replicas=3, n_validators=7, host="127.0.0.1", base_port=
         "piece_hashes": {p: param_hash(init_piece(spec, p)) for p in spec.pieces},
         "balances": {nd["address"]: (20000 if nd["role"] == "agent" else 400) for nd in nodes if nd["role"] != "validator"},
         "params": {"min_stake": 100, "price": 1, "slash_fraction": 0.5, "whistleblower_share": 0.2,
-                   "emission": 30, "accept_tol": 0.0},
+                   "emission": 30, "accept_tol": 0.25},
         "validators": [{k: nd[k] for k in ("address", "sign_pk", "kex_pk", "endpoint")}
                        for nd in nodes if nd["role"] == "validator"],
         "interval": interval, "n_agents": n_agents, "data_seed": seed, "dataset": dataset, "lr": lr,
@@ -93,7 +93,7 @@ def run_node(d, name, rounds=None):
         return
 
     from .agent import Agent
-    from .sim import load_task
+    from .sim import load_task, public_seed_set
     from .server import SliceServer
 
     spec = Spec(**genesis["spec"])
@@ -102,12 +102,12 @@ def run_node(d, name, rounds=None):
     if nd["role"] == "server":
         m = SliceServer(ident, name, nd["piece"], spec, chain, **common)
     else:
-        _, _, _, Xtest, ytest, shards, _ = load_task(genesis.get("dataset", "ring"), genesis["n_agents"],
-                                                     genesis["data_seed"])
+        _, Xall, yall, Xtest, ytest, shards, _ = load_task(genesis.get("dataset", "ring"), genesis["n_agents"],
+                                                           genesis["data_seed"])
         Xtest, ytest = Xtest[:2000], ytest[:2000]
         Xs, ys = shards[nd["index"]]
         perm = np.random.default_rng(nd["index"]).permutation(len(Xs))
-        m = Agent(ident, name, spec, chain, Xs[perm], ys[perm], **common)
+        m = Agent(ident, name, spec, chain, Xs[perm], ys[perm], seed_set=public_seed_set(Xall, yall), **common)
     TCPNetwork(chain.directory).attach(m)
     serve(m, host, port)
     m.register("server" if nd["role"] == "server" else "client", 200, endpoint=nd["endpoint"])
@@ -201,6 +201,10 @@ def local(rounds, interval, attackers, base_port, d, dataset="ring"):
                     or time.time() - t0 > rounds * interval * 6 + 120:
                 break
     finally:
+        try:
+            _ledger_summary(chain)
+        except Exception as e:                          # never let reporting stop the shutdown
+            print(f"  (could not read the ledger: {e})")
         for p in procs.values():
             if p.poll() is None:
                 p.send_signal(signal.SIGTERM)
@@ -209,6 +213,23 @@ def local(rounds, interval, attackers, base_port, d, dataset="ring"):
             if p.poll() is None:
                 p.kill()
     _summary(d, genesis, nodes)
+
+
+def _ledger_summary(chain):
+    chain.refresh()
+    st = chain.state
+    excluded = {}
+    for h in st.history:
+        for addrs in h["trimmed"].values():
+            for a in addrs:
+                excluded[st.nodes[a]["name"]] = excluded.get(st.nodes[a]["name"], 0) + 1
+    print("\n== Ledger (read from the validators) ==")
+    print(f"  training rounds: {len(st.history)}, accepted {sum(h['accepted'] for h in st.history)}")
+    print(f"  updates excluded (servers outvoted / agents given zero trust): {excluded or 'none'}")
+    for a, n in sorted(st.nodes.items(), key=lambda kv: kv[1]["name"]):
+        if n["role"] == "server":
+            print(f"  {n['name']:<10} reputation {n['rep']:>3}  stake {st.stakes[a]:>3}  "
+                  f"{'active' if n['active'] else 'EJECTED'}")
 
 
 def _read(d, name, event=None):

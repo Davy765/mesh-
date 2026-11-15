@@ -13,7 +13,7 @@ import threading
 
 import numpy as np
 
-from .aggregate import dp_release, robust_aggregate
+from .aggregate import dp_release, robust_aggregate, trust_aggregate
 from .chain import make_tx
 from .crypto import sha
 from .model import init_piece, param_hash
@@ -116,8 +116,12 @@ class PieceMember(Peer):
                        if a in commits and commits[a] == sha(param_hash(u), salt))
         if not valid:
             return
-        agg, kept_idx = robust_aggregate([reveals[a][0] for a in valid], [1.0] * len(valid),
-                                         self.max_update_norm())
+        updates = [reveals[a][0] for a in valid]
+        trust = self.trust_scores(updates)
+        if trust is None:
+            agg, kept_idx = robust_aggregate(updates, [1.0] * len(valid), self.max_update_norm())
+        else:
+            agg, kept_idx = trust_aggregate(updates, trust, self.max_update_norm())
         kept = [valid[i] for i in kept_idx]
         if self.behaviour == "poisoner" and self.address in valid and self.address not in kept:
             kept.append(self.address)                     # claims its update should count
@@ -146,6 +150,10 @@ class PieceMember(Peer):
                 self._reset_round()
         if allow_resync and target != self.version and self.online:
             self.resync(target)
+
+    def trust_scores(self, updates):
+        """Per-update trust in [0, 1], or None to use plain poison-resistant averaging."""
+        return None
 
     def fetch_verified(self, target):
         """Download a version of my piece from a peer; never trust it, always check the hash."""
