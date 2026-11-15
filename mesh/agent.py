@@ -24,9 +24,9 @@ def pipeline_makespan(times):
 
 class Agent(PieceMember):
     def __init__(self, identity, name, spec, chain, X, y, *, spot_check=0.15, activation_noise=0.0,
-                 batch=64, val_frac=0.2, **kw):
+                 batch=64, val_frac=0.2, max_val=500, **kw):
         super().__init__(identity, name, "ends", spec, chain, **kw)
-        n_val = int(len(X) * val_frac)
+        n_val = min(int(len(X) * val_frac), max_val)   # held-out check set, kept small: it crosses the network
         self.Xval, self.yval, self.Xtr, self.ytr = X[:n_val], y[:n_val], X[n_val:], y[n_val:]
         self.spot_check, self.activation_noise, self.batch = spot_check, activation_noise, batch
         self.ewma, self.blocked = {}, set()

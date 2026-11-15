@@ -15,23 +15,34 @@ from mesh.sim import World
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rounds", type=int, default=100)
+    ap.add_argument("--rounds", type=int, default=None, help="default 100 (ring) / 150 (mnist)")
+    ap.add_argument("--dataset", choices=["ring", "mnist"], default="ring")
     ap.add_argument("--no-attackers", action="store_true")
     ap.add_argument("--privacy", type=float, default=0.0, help="DP noise multiplier (0 = off)")
     ap.add_argument("--activation-noise", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
 
+    a.rounds = a.rounds or (150 if a.dataset == "mnist" else 100)
     t0 = time.time()
-    w = World(adversaries=not a.no_attackers, dp_sigma=a.privacy, activation_noise=a.activation_noise, seed=a.seed)
+    w = World(adversaries=not a.no_attackers, dp_sigma=a.privacy, activation_noise=a.activation_noise, seed=a.seed,
+              dataset=a.dataset)
     st = w.chain.state
-    captured = []
-    w.net.taps.append(captured.append)                     # a passive eavesdropper on every link
+    spy = {"messages": 0, "bytes": 0, "readable": 0}
+
+    def eavesdrop(env):                                    # a passive eavesdropper on every link
+        spy["messages"] += 1
+        spy["bytes"] += len(env)
+        spy["readable"] += sum(env.count(m) for m in (b"NUMPY", b"receipt", b'"kind"'))
+    w.net.taps.append(eavesdrop)
 
     print("== The network ==")
-    print(f"  model: ends (kept by each agent) + {w.spec.n_slices} slices, each held by "
-          f"{len(w.servers) // w.spec.n_slices} independent servers")
-    print(f"  {len(w.agents)} agents with private data; each sees only 2 of the 4 classes")
+    sizes = {p: sum(v.size for v in w.canonical_model()[p].values()) for p in w.spec.pieces}
+    print(f"  task: {a.dataset} ({w.spec.d_in} inputs, {w.spec.n_classes} classes)")
+    print(f"  model: {sum(sizes.values()):,} parameters = ends {sizes['ends']:,} (kept by each agent) + "
+          f"{w.spec.n_slices} slices of {sizes['slice0']:,}, each slice held by {len(w.servers) // w.spec.n_slices} "
+          f"independent servers")
+    print(f"  {len(w.agents)} agents with private data; each sees only 2 of the {w.spec.n_classes} classes")
     print(f"  {len(w.chain.validators)} validators run the ledger (any 3 of 4 must agree on every block)")
     if not a.no_attackers:
         print("  attackers: server1.0 returns wrong answers half the time, server2.0 sends poisoned updates,")
@@ -40,6 +51,7 @@ def main():
 
     print("\n== Training ==")
     crashed = None
+    t_train = time.time()
     for r in range(a.rounds):
         if r == a.rounds // 2:
             crashed = w.servers[(0, 1)]
@@ -49,9 +61,13 @@ def main():
         if r % 20 == 19 or r == a.rounds - 1:
             hist = [h for h in w.chain.state.history if h["round"] > r - 19]
             acc_n = sum(h["accepted"] for h in hist)
-            print(f"  round {r + 1:3d}: test accuracy {w.accuracy():.1%}   updates accepted {acc_n}/{len(hist)} "
+            print(f"  round {r + 1:3d}: test accuracy {w.accuracy(2000):.1%}   updates accepted {acc_n}/{len(hist)} "
                   f"in the last {len(hist)} rounds (rejected ones were worse network-wide)")
 
+    train_s = time.time() - t_train
+    print(f"  final accuracy on all {len(w.ytest):,} test examples: {w.accuracy():.1%}")
+    print(f"  {train_s / a.rounds:.2f} s of computer time per round; "
+          f"{w.net.bytes_sent / a.rounds / 1e6:.0f} MB of encrypted traffic per round")
     st = w.chain.state
     print("\n== What the defences did ==")
     for e in st.events:
@@ -124,10 +140,8 @@ def main():
             print("  " + e)
 
     print("\n== Privacy ==")
-    blob = b"".join(captured)
-    leaks = sum(blob.count(m) for m in (b"NUMPY", b"receipt", b'"kind"'))
-    print(f"  eavesdropper recorded {len(captured)} messages ({len(blob) / 1e6:.1f} MB): readable model data found: "
-          f"{leaks} (only sender/receiver addresses are visible)")
+    print(f"  eavesdropper saw {spy['messages']} messages ({spy['bytes'] / 1e6:.1f} MB): readable model data found: "
+          f"{spy['readable']} (only sender/receiver addresses are visible)")
     print("  raw data never left an agent; servers only ever saw hidden-layer activations")
     if a.privacy > 0:
         eps = dp_epsilon(a.privacy, w.spec.n_slices + 1, a.rounds)

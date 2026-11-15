@@ -92,6 +92,31 @@ In a test run (40 rounds, 7 validators, about 5 minutes), test accuracy reached 
 **Demo shortcut:** `init` writes every node's key seed into `nodes.json`. In real use, each machine should make its
 own key and share only the public part.
 
+### A bigger model: real handwritten digits (MNIST)
+
+```bash
+python simulate_mesh.py --dataset mnist                          # about 8 minutes
+python -m mesh.run local --dataset mnist --rounds 30 --interval 4  # 21 real processes
+```
+
+Uses 70,000 real 28x28 digit images, downloaded once and checked against their published checksums. The model has
+**1,982,986 parameters**: the agents' ends are 407,050, and each of the 3 slices is 525,312, held by 3 servers.
+Each agent sees only 2 of the 10 digits.
+
+| Run (150 rounds) | Accuracy on 10,000 test digits |
+| --- | --- |
+| Same model trained on one machine, no Mesh | 95.1% |
+| Mesh, everyone honest | 86.0% |
+| Mesh, with all the attackers | 71.3% |
+
+What this shows:
+- **Size cost:** about 3.4 s of computer time and 280 MB of encrypted traffic per round. Over real sockets, with
+  21 processes on a 4-core machine, a hop takes about 264 ms (3 ms with the toy model).
+- **The poisoning server does the most damage.** In 2 million dimensions, honest updates from agents with
+  different data already look very different from each other, so the outlier check never caught the poisoned ones.
+- **Mesh's own safety checks cost about 9 points.** About half the rounds are rejected, and each rejection halves
+  the step size, so learning slows down.
+
 ### Not built yet
 
 Validators joining or

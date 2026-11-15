@@ -23,7 +23,7 @@ from .crypto import Identity
 from .model import Spec, init_piece, param_hash
 from .transport import TCPNetwork, parse_endpoint, serve
 
-LR, CLIP = 0.5, 2.0
+CLIP = 2.0
 
 
 def log(name, **kw):
@@ -32,9 +32,10 @@ def log(name, **kw):
 
 # ---------------------------------------------------------------- config
 def init(d, n_agents=5, replicas=3, n_validators=7, host="127.0.0.1", base_port=9100, attackers=True,
-         interval=2.0, seed=0):
+         interval=2.0, seed=0, dataset="ring"):
+    from .sim import load_task
     os.makedirs(d, exist_ok=True)
-    spec = Spec()
+    spec, *_, lr = load_task(dataset, n_agents, seed)
     port = iter(range(base_port, base_port + 1000))
     nodes = []
     for i in range(n_validators):
@@ -65,7 +66,7 @@ def init(d, n_agents=5, replicas=3, n_validators=7, host="127.0.0.1", base_port=
                    "emission": 30, "accept_tol": 0.0},
         "validators": [{k: nd[k] for k in ("address", "sign_pk", "kex_pk", "endpoint")}
                        for nd in nodes if nd["role"] == "validator"],
-        "interval": interval, "n_agents": n_agents, "data_seed": seed,
+        "interval": interval, "n_agents": n_agents, "data_seed": seed, "dataset": dataset, "lr": lr,
     }
     json.dump(genesis, open(os.path.join(d, "genesis.json"), "w"), indent=1)
     json.dump(nodes, open(os.path.join(d, "nodes.json"), "w"), indent=1)
@@ -91,22 +92,22 @@ def run_node(d, name, rounds=None):
         v.run(host, port, stop)
         return
 
-    from swarm.data import make_dataset, split_non_iid
     from .agent import Agent
+    from .sim import load_task
     from .server import SliceServer
 
     spec = Spec(**genesis["spec"])
     chain = RemoteChain(genesis)
-    common = dict(lr=LR, clip_norm=CLIP, dp_sigma=0.0, behaviour=nd["behaviour"], seed=abs(hash(name)) % 2 ** 31)
+    common = dict(lr=genesis.get("lr", 0.5), clip_norm=CLIP, dp_sigma=0.0, behaviour=nd["behaviour"], seed=abs(hash(name)) % 2 ** 31)
     if nd["role"] == "server":
         m = SliceServer(ident, name, nd["piece"], spec, chain, **common)
     else:
-        X, y = make_dataset(n=6000, seed=1)
-        shards, _ = split_non_iid(X, y, genesis["n_agents"], seed=genesis["data_seed"])
+        _, _, _, Xtest, ytest, shards, _ = load_task(genesis.get("dataset", "ring"), genesis["n_agents"],
+                                                     genesis["data_seed"])
+        Xtest, ytest = Xtest[:2000], ytest[:2000]
         Xs, ys = shards[nd["index"]]
         perm = np.random.default_rng(nd["index"]).permutation(len(Xs))
         m = Agent(ident, name, spec, chain, Xs[perm], ys[perm], **common)
-        Xtest, ytest = make_dataset(n=2000, seed=2)
     TCPNetwork(chain.directory).attach(m)
     serve(m, host, port)
     m.register("server" if nd["role"] == "server" else "client", 200, endpoint=nd["endpoint"])
@@ -160,8 +161,8 @@ def _report_validator(v, name, stop):
 
 
 # ---------------------------------------------------------------- everything locally
-def local(rounds, interval, attackers, base_port, d):
-    genesis, nodes = init(d, interval=interval, attackers=attackers, base_port=base_port)
+def local(rounds, interval, attackers, base_port, d, dataset="ring"):
+    genesis, nodes = init(d, interval=interval, attackers=attackers, base_port=base_port, dataset=dataset)
     os.makedirs(os.path.join(d, "logs"), exist_ok=True)
     procs = {}
 
@@ -254,21 +255,24 @@ def main():
     a.add_argument("--no-attackers", action="store_true")
     a.add_argument("--port", type=int, default=9100)
     a.add_argument("--dir", default="net-local")
+    a.add_argument("--dataset", choices=["ring", "mnist"], default="ring")
     b = sub.add_parser("init")
     b.add_argument("--dir", default="net")
     b.add_argument("--host", default="127.0.0.1")
     b.add_argument("--port", type=int, default=9100)
     b.add_argument("--interval", type=float, default=2.0)
     b.add_argument("--no-attackers", action="store_true")
+    b.add_argument("--dataset", choices=["ring", "mnist"], default="ring")
     c = sub.add_parser("node")
     c.add_argument("--dir", default="net")
     c.add_argument("--name", required=True)
     c.add_argument("--rounds", type=int, default=None)
     args = ap.parse_args()
     if args.cmd == "local":
-        local(args.rounds, args.interval, not args.no_attackers, args.port, args.dir)
+        local(args.rounds, args.interval, not args.no_attackers, args.port, args.dir, args.dataset)
     elif args.cmd == "init":
-        init(args.dir, host=args.host, base_port=args.port, interval=args.interval, attackers=not args.no_attackers)
+        init(args.dir, host=args.host, base_port=args.port, interval=args.interval, attackers=not args.no_attackers,
+             dataset=args.dataset)
         print(f"wrote {args.dir}/genesis.json and {args.dir}/nodes.json")
     else:
         run_node(args.dir, args.name, args.rounds)

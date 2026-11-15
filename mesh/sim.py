@@ -11,14 +11,25 @@ from .network import SimNetwork
 from .server import SliceServer
 
 
+def load_task(dataset, n_agents, seed=0):
+    """Returns (spec, Xtrain, ytrain, Xtest, ytest, per-agent shards, learning rate)."""
+    if dataset == "mnist":
+        from .datasets import mnist, split_by_class
+        X, y, Xt, yt = mnist()
+        return (Spec(d_in=784, hidden=512, n_classes=10), X, y, Xt, yt,
+                split_by_class(X, y, n_agents, seed), 0.2)
+    X, y = make_dataset(n=6000, seed=1)
+    Xt, yt = make_dataset(n=2000, seed=2)
+    return Spec(), X, y, Xt, yt, split_non_iid(X, y, n_agents, seed=seed)[0], 0.5
+
+
 class World:
     def __init__(self, n_agents=5, replicas=3, adversaries=True, dp_sigma=0.0, activation_noise=0.0,
-                 spot_check=0.15, lr=0.5, clip_norm=2.0, seed=0):
-        self.spec = spec = Spec()
+                 spot_check=0.15, lr=None, clip_norm=2.0, seed=0, dataset="ring"):
+        self.spec, X, y, self.Xtest, self.ytest, shards, default_lr = load_task(dataset, n_agents, seed)
+        spec = self.spec
+        lr = default_lr if lr is None else lr
         rng = np.random.default_rng(seed)
-        X, y = make_dataset(n=6000, seed=1)
-        self.Xtest, self.ytest = make_dataset(n=2000, seed=2)
-        shards, _ = split_non_iid(X, y, n_agents, seed=seed)
 
         v_ids = [Identity(f"validator-{i}-{seed}") for i in range(4)]
         s_ids = {(i, r): Identity(f"server-{i}-{r}-{seed}") for i in range(spec.n_slices) for r in range(replicas)}
@@ -97,9 +108,10 @@ class World:
                 pieces[m.piece] = m.params
         return pieces
 
-    def accuracy(self):
+    def accuracy(self, n=None):
         p = self.canonical_model()
-        h, _ = embed(p["ends"], self.Xtest)
+        X, y = (self.Xtest, self.ytest) if n is None else (self.Xtest[:n], self.ytest[:n])
+        h, _ = embed(p["ends"], X)
         for i in range(self.spec.n_slices):
             h = slice_forward(p[f"slice{i}"], h)
-        return float((head(p["ends"], h).argmax(1) == self.ytest).mean())
+        return float((head(p["ends"], h).argmax(1) == y).mean())
