@@ -1,5 +1,15 @@
 # Swarm & Mesh: decentralized AI prototypes
 
+[![tests](https://github.com/Davy765/swarm/actions/workflows/tests.yml/badge.svg)](https://github.com/Davy765/swarm/actions/workflows/tests.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+> **Get involved.** This is an open research prototype with real unsolved problems: attacks to find, defences
+> to design, experiments to run. Newcomers are welcome.
+> - Start with an issue labelled [`good first issue`](https://github.com/Davy765/swarm/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22),
+>   or pick a bigger open problem labelled [`help wanted`](https://github.com/Davy765/swarm/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22).
+> - [CONTRIBUTING.md](CONTRIBUTING.md) explains how to set up, test and send a pull request.
+> - Found a way to break one of Mesh's defences? [Report the attack](https://github.com/Davy765/swarm/issues/new?template=attack.md); that's one of the most useful contributions.
+
 Two prototypes in Python (needs `numpy` and `cryptography`: `pip install -r requirements.txt`).
 
 | | What it is | Run it |
@@ -7,7 +17,7 @@ Two prototypes in Python (needs `numpy` and `cryptography`: `pip install -r requ
 | **Swarm** (`swarm/`) | Peers learn one model together by gossiping weights. Simple and small. | `python simulate.py` |
 | **Mesh** (`mesh/`) | One model **split across many servers**, trained by agents with private data, coordinated and paid through a **small blockchain**, with defences against cheating. | `python simulate_mesh.py` |
 
-Tests: `python -m unittest discover -s tests` (16 tests, about 15 s).
+Tests: `python -m unittest discover -s tests` (19 tests, about 15 s). They also run automatically on every pull request.
 
 ---
 
@@ -171,3 +181,9 @@ python simulate.py --peers 8 --seconds 15 --secret k --kill 2
 ```
 
 Each node exposes `GET /info`, `GET /model`, `POST /gossip` and `POST /predict` over HTTP.
+
+---
+
+## License
+
+MIT; see [LICENSE](LICENSE). Contributions are accepted under the same license.
