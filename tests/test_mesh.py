@@ -88,6 +88,14 @@ class Ledger(unittest.TestCase):
         self.assertEqual(chain.state.nodes, {})
 
 
+class Agreement(unittest.TestCase):
+    def test_privacy_noise_does_not_stop_agents_agreeing(self):
+        w = World(adversaries=False, activation_noise=0.5)
+        for _ in range(6):
+            w.round()
+        self.assertTrue(any(h["accepted"] for h in w.chain.state.history))
+
+
 class WholeSystem(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -106,11 +114,27 @@ class WholeSystem(unittest.TestCase):
         self.assertLess(st.stakes[liar.address], 200)
         self.assertLess(st.nodes[liar.address]["rep"], 5)
 
-    def test_poisoned_server_updates_are_trimmed(self):
+    def test_poisoned_server_is_outvoted_every_round(self):
         st = self.w.chain.state
         poisoner = next(s for s in self.w.servers.values() if s.behaviour == "poisoner")
-        trimmed = sum(poisoner.address in h["trimmed"].get("slice2", []) for h in st.history)
-        self.assertGreater(trimmed, 0)
+        rounds = [h for h in st.history if "slice2" in h["trimmed"]]
+        self.assertTrue(rounds)
+        self.assertTrue(all(poisoner.address in h["trimmed"]["slice2"] for h in rounds))
+        self.assertEqual(st.nodes[poisoner.address]["rep"], 10)   # reputation only grows with training rewards
+
+    def test_honest_replicas_compute_identical_updates(self):
+        st = self.w.chain.state
+        honest = {s.address for s in self.w.servers.values() if s.behaviour == "honest" and s.online}
+        for h in st.history:
+            for p in ("slice0", "slice1"):
+                self.assertFalse(honest & set(h["trimmed"].get(p, [])), f"honest replica outvoted in {p}")
+
+    def test_poisoning_agent_gets_zero_trust(self):
+        st = self.w.chain.state
+        cheat = next(a for a in self.w.agents if a.behaviour == "poisoner")
+        rounds = [h for h in st.history if "ends" in h["trimmed"]]
+        excluded = sum(cheat.address in h["trimmed"]["ends"] for h in rounds)
+        self.assertGreaterEqual(excluded, 0.9 * len(rounds))
 
     def test_traffic_is_unreadable_and_tampering_is_detected(self):
         blob = b"".join(self.taps)

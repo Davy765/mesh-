@@ -1,7 +1,7 @@
 """A small replicated ledger: the rulebook and the bank. It never runs the model.
 
-Validators each keep their own copy of the state. A block counts only if at least 2f+1 of the
-3f+1 validators re-executed it independently and signed the same resulting state, so one
+Validators each keep their own copy of the state. A block counts only if at least n-f of the
+n >= 3f+1 validators re-executed it independently and signed the same resulting state, so one
 dishonest validator can neither forge balances nor stall the chain (the next proposer takes over).
 
 Everything heavy (activations, weights, updates) stays off-chain. The chain only stores:
@@ -52,9 +52,18 @@ class State:
         self.jobs = {}
         self.events = []
 
+    @classmethod
+    def from_obj(cls, obj, genesis, events=()):
+        """Rebuild a state received over the network (the caller has checked its hash)."""
+        s = cls(genesis)
+        for k, v in obj.items():
+            setattr(s, k, v)
+        s.events = list(events)
+        return s
+
     @staticmethod
     def _fresh_round():
-        return {"commits": {}, "candidates": {}, "chosen": {}, "votes": {}, "work": {}}
+        return {"commits": {}, "candidates": {}, "chosen": {}, "votes": {}, "work": {}, "contribs": {}}
 
     def copy(self):
         return copy.deepcopy(self)
@@ -112,7 +121,8 @@ class State:
         self.balances[s] -= stake
         self.stakes[s] = stake
         self.nodes[s] = {"role": role, "piece": piece, "sign_pk": b["sign_pk"], "kex_pk": b["kex_pk"],
-                         "rep": 10, "active": True, "name": str(b.get("name", ""))[:32]}
+                         "rep": 10, "active": True, "name": str(b.get("name", ""))[:32],
+                         "endpoint": str(b.get("endpoint", ""))[:100]}
         self.log(f"{b.get('name', s[:8])} registered as {role} for {piece}, stake {stake}")
 
     def _member_check(self, s, piece, rnd, phase):
@@ -127,6 +137,20 @@ class State:
         if err:
             return err
         self.cur["commits"].setdefault(b["piece"], {})[s] = str(b["digest"])
+
+    def _tx_contrib(self, s, b):
+        """An agent declares the fingerprint of the training data it sent to each slice this round.
+        Every replica of that slice must compute its update from exactly these inputs."""
+        n = self.nodes.get(s)
+        if not n or not n["active"] or n["role"] != "client":
+            return "only active agents"
+        if b["round"] != self.round or self.phase != "commit":
+            return f"wrong round/phase (now round {self.round} {self.phase})"
+        inputs = {str(p): str(h) for p, h in b["inputs"].items()}
+        if any(p not in self.canonical or p == "ends" for p in inputs):
+            return "bad piece"
+        for p, h in inputs.items():
+            self.cur["contribs"].setdefault(p, {})[s] = h
 
     def _tx_candidate(self, s, b):
         err = self._member_check(s, b["piece"], b["round"], "reveal")
@@ -282,26 +306,38 @@ class State:
         if not self.cur["commits"]:
             return
         pieces = list(self.canonical)
-        # Each agent reports how the candidate changed ITS held-out loss. Agents hold different data,
-        # so judge the network-wide effect: trimmed mean (ignore the most extreme reports) of all reports.
+        # Each agent reports the relative change of ITS held-out loss under the candidate. Agents hold
+        # different data, so judge the network-wide effect: trimmed mean (ignore the most extreme reports).
+        # Ordinary training steps often raise the loss a little and still make progress overall, so only a
+        # clearly harmful round (more than accept_tol worse) is rejected.
         deltas = sorted(v for a, v in self.cur["votes"].items() if a in self.members("ends"))
         cut = len(deltas) // 5 if len(deltas) >= 5 else 0
         mid = deltas[cut:len(deltas) - cut]
         score = sum(mid) / len(mid) if mid else float("inf")
         enough = len(deltas) * 2 > len(self.members("ends"))
         accepted = all(p in self.cur["chosen"] for p in pieces) and enough and score <= self.params["accept_tol"]
-        self.lr_scale = min(1.0, self.lr_scale * 2) if accepted else max(1 / 64, self.lr_scale / 2)
-        outcome = {"round": self.round, "accepted": accepted, "loss_change": round(score, 6),
-                   "trimmed": {p: sorted(set(self.cur["commits"].get(p, {})) - set(self.cur["chosen"][p][1]))
-                               for p in pieces if p in self.cur["chosen"]}}
+        up, down = self.params.get("lr_up", 2.0), self.params.get("lr_down", 0.5)
+        self.lr_scale = min(1.0, self.lr_scale * up) if accepted else max(1 / 64, self.lr_scale * down)
+        def agreeing(p):     # slice servers whose candidate matched the majority's
+            return [a for a, (d, _) in self.cur["candidates"].get(p, {}).items() if d == self.cur["chosen"][p][0]]
+
+        trimmed = {}
+        for p in pieces:
+            if p not in self.cur["chosen"]:
+                continue
+            if p == "ends":      # agents' own updates: those the poison-resistant average left out
+                trimmed[p] = sorted(set(self.cur["commits"].get(p, {})) - set(self.cur["chosen"][p][1]))
+            else:                # servers whose computed update disagreed with the majority
+                trimmed[p] = sorted(set(self.cur["candidates"].get(p, {})) - set(agreeing(p)))
+        outcome = {"round": self.round, "accepted": accepted, "loss_change": round(score, 6), "trimmed": trimmed}
         if accepted:
             for p in pieces:
                 self.canonical[p] = self.cur["chosen"][p][0]
                 if p == "ends":
                     continue
-                kept = [a for a in self.cur["chosen"][p][1] if self.cur["work"].get(a, 0) > 0]
+                kept = [a for a in agreeing(p) if self.cur["work"].get(a, 0) > 0]
                 total = sum(self.cur["work"][a] for a in kept)
-                for a in kept:            # training reward: only for kept updates, in proportion to paid work
+                for a in kept:            # training reward: only for servers that computed the agreed update
                     self.balances[a] = self.balances.get(a, 0) + \
                         self.params["emission"] * self.cur["work"][a] // total
                     self.nodes[a]["rep"] += 1
@@ -334,27 +370,37 @@ class Validator:
         block["hash"] = sha(canon(block))
         return block
 
-    def check(self, block):
-        """Re-execute the block independently; sign only if we reach the same state."""
+    def _verify_exec(self, block):
+        """Check a block extends my chain and re-execute it. Returns (new state, results) or None."""
         if block["height"] != self.state.height or \
                 block["prev"] != (self.blocks[-1]["hash"] if self.blocks else "genesis"):
             return None
-        body = {k: v for k, v in block.items() if k != "hash"}
+        body = {k: v for k, v in block.items() if k not in ("hash", "sigs", "results")}
         if sha(canon(body)) != block["hash"] or merkle_root([tx_hash(t) for t in block["txs"]]) != block["tx_root"]:
             return None
         s, results = self._execute(block["txs"])
-        if s.root() != block["state_root"]:
+        return (s, results) if s.root() == block["state_root"] else None
+
+    def check(self, block):
+        """Re-execute the block independently; sign only if we reach the same state."""
+        r = self._verify_exec(block)
+        if r is None:
             return None
-        self._pending[block["hash"]] = (s, results)
+        self._pending[block["hash"]] = r
         return self.id.sign(bytes.fromhex(block["hash"]))
 
     def commit(self, block, sigs, validator_keys, quorum):
+        """Adopt a block that a quorum signed (also used to catch up on blocks I missed)."""
         good = {a for a, sig in sigs.items()
                 if a in validator_keys and verify(validator_keys[a], sig, bytes.fromhex(block["hash"]))}
-        if len(good) < quorum or block["hash"] not in self._pending:
+        if len(good) < quorum:
             return False
-        self.state, results = self._pending.pop(block["hash"])
+        r = self._pending.pop(block["hash"], None) or self._verify_exec(block)
+        if r is None:
+            return False
+        self.state, results = r
         self._pending.clear()
+        block = {k: v for k, v in block.items() if k not in ("sigs", "results")}
         self.blocks.append({**block, "sigs": sigs, "results": results})
         included = {tx_hash(t) for t in block["txs"]}
         self.mempool = [t for t in self.mempool if tx_hash(t) not in included]
@@ -368,7 +414,7 @@ class Chain:
         self.validators = [Validator(v, genesis, corrupt=v.address in corrupt) for v in validator_ids]
         self.keys = {v.address: v.id.sign_pk for v in self.validators}
         n = len(self.validators)
-        self.quorum = 2 * ((n - 1) // 3) + 1
+        self.quorum = n - (n - 1) // 3          # tolerates f = (n-1)//3 faulty validators
         self.rejected_proposals = 0
 
     @property

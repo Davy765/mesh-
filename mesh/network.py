@@ -21,7 +21,7 @@ class Rejected(Exception):
 
 class SimNetwork:
     def __init__(self, directory, timeout_ms=800):
-        self.directory = directory          # addr -> (sign_pk, kex_pk), read from the chain
+        self.directory = directory          # addr -> (sign_pk, kex_pk[, endpoint]), read from the chain
         self.nodes = {}
         self.taps = []                      # callables(bytes): passive eavesdroppers
         self.tamper = None                  # callable(bytes) -> bytes: active attacker
@@ -68,7 +68,7 @@ class Peer:
 
     # envelope = len | header json | signature(64 bytes) | ciphertext
     def seal(self, dst_addr, kind, meta, arrays=None):
-        _, kex = self.net.directory(dst_addr)
+        kex = self.net.directory(dst_addr)[1]
         nonce = os.urandom(12)
         header = canon({"src": self.address, "dst": dst_addr, "nonce": nonce.hex()})
         ct = self.id.encrypt(dst_addr, kex, nonce, wire.pack({"kind": kind, **meta}, arrays), header)
@@ -86,7 +86,7 @@ class Peer:
         keys = self.net.directory(src)
         if keys is None:
             raise Rejected("unknown sender (not registered on chain)")
-        sign_pk, kex = keys
+        sign_pk, kex = keys[0], keys[1]
         if not verify(sign_pk, sig.hex(), header_b + ct):
             raise Rejected("bad signature")
         if header["nonce"] in self._seen:
