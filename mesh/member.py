@@ -73,10 +73,15 @@ class PieceMember(Peer):
         return sum(v.size for v in self.params.values())
 
     def current_lr(self):
-        """Ramp up over the first rounds (big early gradients overshoot), then follow the chain's
-        step-size control: after a rejected round everyone takes a smaller step."""
+        """Ramp up over the first rounds (big early gradients overshoot), follow the chain's step-size
+        control (after a rejected round everyone takes a smaller step), and decay over the planned run
+        if genesis says so. Everything here comes from the chain, so every node gets the same value."""
         st = self.chain.state
-        return self.lr * min(1.0, (st.round + 1) / self.warmup) * st.lr_scale
+        lr = self.lr * min(1.0, (st.round + 1) / self.warmup) * st.lr_scale
+        decay = st.params.get("lr_decay_rounds")
+        if decay:   # shrink steps over the planned run, down to 10%: clipped gradients keep a constant size,
+            lr *= max(0.1, 1 - st.round / decay)   # so a fixed step never lets the output layer settle
+        return lr
 
     def max_update_norm(self):
         return self.current_lr() * self.C * (1 + 2 * self.sigma * math.sqrt(self._n_params()))

@@ -32,7 +32,7 @@ def load_task(dataset, n_agents, seed=0):
 class World:
     def __init__(self, n_agents=5, replicas=3, adversaries=True, dp_sigma=0.0, activation_noise=0.0,
                  spot_check=0.15, lr=None, clip_norm=2.0, seed=0, dataset="ring", accept_tol=0.25,
-                 lr_down=0.5, lr_up=2.0, seed_set=True):
+                 lr_down=0.5, lr_up=2.0, seed_set=True, lr_decay_rounds=None):
         self.spec, X, y, self.Xtest, self.ytest, shards, default_lr = load_task(dataset, n_agents, seed)
         spec = self.spec
         lr = default_lr if lr is None else lr
@@ -47,7 +47,8 @@ class World:
             "piece_hashes": {p: param_hash(init_piece(spec, p)) for p in spec.pieces},
             "balances": {**{i.address: 400 for i in s_ids.values()}, **{i.address: 20000 for i in a_ids}},
             "params": {"min_stake": 100, "price": 1, "slash_fraction": 0.5, "whistleblower_share": 0.2,
-                       "emission": 30, "accept_tol": accept_tol, "lr_down": lr_down, "lr_up": lr_up},
+                       "emission": 30, "accept_tol": accept_tol, "lr_down": lr_down, "lr_up": lr_up,
+                       "lr_decay_rounds": lr_decay_rounds},
         }
         self.corrupt_validator = v_ids[1].address if adversaries else None
         self.chain = Chain(genesis, v_ids, corrupt={self.corrupt_validator} if adversaries else set())

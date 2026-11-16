@@ -32,7 +32,7 @@ def log(name, **kw):
 
 # ---------------------------------------------------------------- config
 def init(d, n_agents=5, replicas=3, n_validators=7, host="127.0.0.1", base_port=9100, attackers=True,
-         interval=2.0, seed=0, dataset="ring"):
+         interval=2.0, seed=0, dataset="ring", rounds=None):
     from .sim import load_task
     os.makedirs(d, exist_ok=True)
     spec, *_, lr = load_task(dataset, n_agents, seed)
@@ -63,7 +63,7 @@ def init(d, n_agents=5, replicas=3, n_validators=7, host="127.0.0.1", base_port=
         "piece_hashes": {p: param_hash(init_piece(spec, p)) for p in spec.pieces},
         "balances": {nd["address"]: (20000 if nd["role"] == "agent" else 400) for nd in nodes if nd["role"] != "validator"},
         "params": {"min_stake": 100, "price": 1, "slash_fraction": 0.5, "whistleblower_share": 0.2,
-                   "emission": 30, "accept_tol": 0.25},
+                   "emission": 30, "accept_tol": 0.25, "lr_decay_rounds": rounds},
         "validators": [{k: nd[k] for k in ("address", "sign_pk", "kex_pk", "endpoint")}
                        for nd in nodes if nd["role"] == "validator"],
         "interval": interval, "n_agents": n_agents, "data_seed": seed, "dataset": dataset, "lr": lr,
@@ -162,7 +162,8 @@ def _report_validator(v, name, stop):
 
 # ---------------------------------------------------------------- everything locally
 def local(rounds, interval, attackers, base_port, d, dataset="ring"):
-    genesis, nodes = init(d, interval=interval, attackers=attackers, base_port=base_port, dataset=dataset)
+    genesis, nodes = init(d, interval=interval, attackers=attackers, base_port=base_port, dataset=dataset,
+                          rounds=rounds)
     os.makedirs(os.path.join(d, "logs"), exist_ok=True)
     procs = {}
 
@@ -284,6 +285,7 @@ def main():
     b.add_argument("--interval", type=float, default=2.0)
     b.add_argument("--no-attackers", action="store_true")
     b.add_argument("--dataset", choices=["ring", "mnist"], default="ring")
+    b.add_argument("--rounds", type=int, default=None, help="planned training rounds (step size decays over them)")
     c = sub.add_parser("node")
     c.add_argument("--dir", default="net")
     c.add_argument("--name", required=True)
@@ -293,7 +295,7 @@ def main():
         local(args.rounds, args.interval, not args.no_attackers, args.port, args.dir, args.dataset)
     elif args.cmd == "init":
         init(args.dir, host=args.host, base_port=args.port, interval=args.interval, attackers=not args.no_attackers,
-             dataset=args.dataset)
+             dataset=args.dataset, rounds=args.rounds)
         print(f"wrote {args.dir}/genesis.json and {args.dir}/nodes.json")
     else:
         run_node(args.dir, args.name, args.rounds)

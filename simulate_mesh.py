@@ -26,7 +26,7 @@ def main():
     a.rounds = a.rounds or (150 if a.dataset == "mnist" else 100)
     t0 = time.time()
     w = World(adversaries=not a.no_attackers, dp_sigma=a.privacy, activation_noise=a.activation_noise, seed=a.seed,
-              dataset=a.dataset)
+              dataset=a.dataset, lr_decay_rounds=a.rounds)
     st = w.chain.state
     spy = {"messages": 0, "bytes": 0, "readable": 0}
 

@@ -112,11 +112,14 @@ Uses 70,000 real 28x28 digit images, downloaded once and checked against their p
 **1,982,986 parameters**: the agents' ends are 407,050, and each of the 3 slices is 525,312, held by 3 servers.
 Each agent sees only 2 of the 10 digits.
 
-| Run (150 rounds) | Accuracy on 10,000 test digits |
+Accuracy on the 10,000 test digits after 150 rounds:
+
+| Run | Accuracy |
 | --- | --- |
-| Same model trained on one machine, no Mesh | 95.1% |
-| Mesh, everyone honest | 91.6% |
-| Mesh, with all the attackers | 74.4%: digits 0–3 and 5–7 at 86–99%; 4 and 9 (only the cheater has them) at 39% and 0%; 8 at 37% |
+| Same model on one machine, no Mesh, fixed step size | 88.6% at the end (it touched 95.1% at one checkpoint) |
+| Same, with the step size shrinking over the run | 91.2% |
+| Mesh, everyone honest (average of the last 3 checkpoints, 3 seeds) | 88.9% (87.8% with a fixed step size) |
+| Mesh, with all the attackers (1 run) | 82.1%: digits 0–3 and 5–8 at 89–99%; 4 and 9 (only the cheater has them) at 42% and 27% |
 
 What this shows:
 - **Size cost:** about 3.4 s of computer time and 280 MB of encrypted traffic per round. Over real sockets, with
@@ -124,8 +127,15 @@ What this shows:
 - **Earlier version:** 86.0% honest and 71.3% with attackers. There, the outlier check never caught the
   poisoning server in 2 million dimensions, and a vote that rejected any loss increase threw away half the rounds.
   Verified slice training, trust weighting and the relative 25% vote fixed both.
-- **What attackers still cost:** mostly the digits only the cheater holds. Digit 8, which belongs to an honest
-  agent, also dropped to 37% in this run, and I haven't pinned down why.
+- **Single digits swing, even without Mesh.** With a fixed step size, one digit often lost more than 20 points
+  in a single round; on one machine with no network and no attackers this happened 110 times after round 50.
+  Each agent's gradient is clipped to a fixed size for privacy, and the output layer's gradients stay above that
+  limit, so every step is the same size and that layer never settles. An earlier report that digit 8 had dropped
+  to 37% was a snapshot taken during one of these dips: a rerun with the same settings ended with digit 8 at 96%.
+  The step size now shrinks over the planned run (`lr_decay_rounds`, fixed at genesis so every node agrees). On
+  one machine that cut the big dips from 110 to 21; in Mesh it cut them by about a third and raised the weakest
+  digit from 70% to 77% on average.
+- **What attackers still cost:** mostly the digits only the cheater holds.
 
 ### Not built yet
 
