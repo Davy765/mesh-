@@ -2,6 +2,12 @@
 
 [![tests](https://github.com/Davy765/mesh-/actions/workflows/tests.yml/badge.svg)](https://github.com/Davy765/mesh-/actions/workflows/tests.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Davy765/mesh-?quickstart=1)
+
+![Mesh demo: training under attack, with the attackers caught](docs/demo.gif)
+
+**Try it in your browser:** click "Open in GitHub Codespaces" above, wait for it to set up, then type
+`python simulate_mesh.py` in the terminal. Nothing to install; it runs on GitHub's free Codespaces allowance.
 
 > **Get involved.** This is an open research prototype with real unsolved problems: attacks to find, defences
 > to design, experiments to run. Newcomers are welcome.
