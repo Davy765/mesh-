@@ -86,6 +86,7 @@ class State:
 
     def log(self, msg):
         self.events.append(f"[block {self.height}] {msg}")
+        del self.events[:-self.params.get("history_keep", 500)]
 
     # ---- transactions ----------------------------------------------------------
     def apply(self, tx):
@@ -343,6 +344,9 @@ class State:
                         self.params["emission"] * self.cur["work"][a] // total
                     self.nodes[a]["rep"] += 1
         self.history.append(outcome)
+        # The live state keeps only recent rounds so it (and every copy, hash and download of it) stays a
+        # bounded size; the full record is in the blocks, which validators keep on disk.
+        del self.history[:-self.params.get("history_keep", 500)]
 
 
 class Validator:

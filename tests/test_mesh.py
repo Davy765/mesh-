@@ -88,6 +88,19 @@ class Ledger(unittest.TestCase):
         self.assertEqual(chain.state.nodes, {})
 
 
+class LedgerSize(unittest.TestCase):
+    def test_live_state_keeps_only_recent_history(self):
+        w = World(adversaries=True)
+        for v in w.chain.validators:
+            v.state.params["history_keep"] = 5
+        for _ in range(9):
+            w.round()
+        st = w.chain.state
+        self.assertEqual([h["round"] for h in st.history], list(range(st.round - 5, st.round)))
+        self.assertLessEqual(len(st.events), 5)
+        self.assertTrue(all(v.state.root() == st.root() for v in w.chain.validators))
+
+
 class Privacy(unittest.TestCase):
     def test_vote_is_strict_when_privacy_noise_is_on(self):
         self.assertEqual(World(adversaries=False, dp_sigma=1.0).chain.state.params["accept_tol"], 0.0)
