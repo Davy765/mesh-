@@ -27,3 +27,28 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Quick demo run
         run: timeout 300 python simulate_mesh.py --rounds 20
+
+  network:
+    # The real thing: 21 separate processes talking over sockets, with a server and a validator
+    # killed halfway and restarted later. Runs once over raw TCP and once over HTTP.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        carrier: ["", "--http"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run a 12-round network
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+        run: |
+          timeout 600 python -m mesh.run local --rounds 12 --interval 1.5 --dir net-ci ${{ matrix.carrier }} | tee out.txt
+          grep -q "node errors logged: 0" out.txt
+          grep -q "validator3 after its restart: replayed_blocks=" out.txt
+          grep -q "server0.1 after its restart: .*resynced=True" out.txt
+          grep -Eq "training rounds: [0-9]+, accepted [1-9]" out.txt
+
