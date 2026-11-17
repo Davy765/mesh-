@@ -53,7 +53,7 @@ jobs:
           grep -Eq "training rounds: [0-9]+, accepted [1-9]" out.txt
       - name: Keep the node logs if it failed
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: logs-${{ github.job }}-${{ strategy.job-index }}
           path: net-ci/logs/
@@ -85,7 +85,7 @@ jobs:
           grep -Eq "training rounds: [0-9]+, accepted [1-9]" m0.out
       - name: Keep the node logs if it failed
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: logs-${{ github.job }}-${{ strategy.job-index }}
           path: net-m*/logs/
@@ -124,7 +124,7 @@ jobs:
           ! grep -h '"error"' net-tn/logs/newcomer*.log
       - name: Keep the node logs if it failed
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: logs-${{ github.job }}-${{ strategy.job-index }}
           path: net-tn/logs/
