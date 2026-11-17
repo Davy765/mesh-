@@ -117,3 +117,74 @@ class Limits(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WebServices(unittest.TestCase):
+    def _faucet(self, per_day=3):
+        from mesh.testnet import Faucet
+
+        class StubChain:
+            def __init__(self):
+                self.sent = []
+
+                class S:
+                    balances = {}
+                    nonces = {}
+                self.state = S()
+
+            def submit(self, tx):
+                self.sent.append(tx)
+        f = Faucet.__new__(Faucet)
+        f.chain, f.id = StubChain(), Identity.generate()
+        f.chain.state.balances[f.id.address] = 10 ** 6
+        f.amount, f.per_ip, f.per_day = 100, 2, per_day
+        f.given, f.ip_log, f.day_log = set(), {}, []
+        import threading
+        f.lock, f.nonce, f.last_submit = threading.Lock(), 0, 0.0
+        return f
+
+    def test_faucet_limits(self):
+        f = self._faucet(per_day=3)
+        a = [("%040x" % i) for i in range(1, 6)]
+        self.assertEqual(f.drip(a[0], "1.1.1.1")[0], 200)
+        self.assertEqual(f.drip(a[0], "2.2.2.2")[0], 429)          # once per address
+        self.assertEqual(f.drip(a[1], "1.1.1.1")[0], 200)
+        self.assertEqual(f.drip(a[2], "1.1.1.1")[0], 429)          # per-IP limit (2/hour here)
+        self.assertEqual(f.drip(a[2], "3.3.3.3")[0], 200)
+        self.assertEqual(f.drip(a[3], "4.4.4.4")[0], 429)          # daily cap (3 here)
+        self.assertEqual(f.drip("not-an-address", "5.5.5.5")[0], 400)
+        self.assertEqual(len(f.chain.sent), 3)
+
+    def test_status_page_sends_security_headers(self):
+        import http.client
+        import json as _json
+        import socket
+        from unittest import mock
+        from mesh import testnet
+
+        with tempfile.TemporaryDirectory() as d:
+            from mesh import run
+            genesis, _ = run.init(d, n_agents=1, replicas=1, n_validators=4)
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        w = World(adversaries=False)
+        with mock.patch.object(testnet, "RemoteChain", lambda g, ttl=2.0: type("C", (), {
+                "state": property(lambda self: w.chain.state), "endpoints": [1, 2, 3, 4], "f": 1})()):
+            srv = testnet.serve_status(genesis, port, host="127.0.0.1")
+        import threading
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            for path in ("/", "/api/status", "/genesis.json"):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                c.request("GET", path)
+                r = c.getresponse()
+                body = r.read()
+                self.assertEqual(r.status, 200)
+                self.assertIn("default-src 'none'", r.getheader("Content-Security-Policy"))
+                self.assertEqual(r.getheader("X-Frame-Options"), "DENY")
+                c.close()
+            self.assertIn("validators", _json.loads(body))
+        finally:
+            srv.shutdown()
+            srv.server_close()

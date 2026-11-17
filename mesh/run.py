@@ -189,7 +189,7 @@ def run_member(d, genesis, nd, ident, rounds=None):
     log(name, event="started", endpoint=nd["endpoint"], address=m.address)
 
     I = genesis["interval"]
-    seen, joined = None, False
+    seen, joined, trained_round = None, False, -1
     while not stop.is_set():
         st = chain.state
         key = (st.round, st.phase)
@@ -206,7 +206,8 @@ def run_member(d, genesis, nd, ident, rounds=None):
                 else:                                  # first round I take part in: make sure my weights
                     m.rejoin()                         # are this round's (the network may have moved on)
                 joined = True
-                if nd["role"] == "agent":
+                if nd["role"] == "agent" and st.round > trained_round:
+                    trained_round = st.round            # one training step per round, whatever the view does
                     time.sleep(0.15 * I)          # let servers switch to this round's weights first
                     m.train_step()
                     m.phase_commit()
@@ -655,6 +656,9 @@ def main():
     fa.add_argument("--key", required=True, help="the faucet account's key file")
     fa.add_argument("--port", type=int, default=8090)
     fa.add_argument("--amount", type=int, default=1500)
+    fa.add_argument("--per-day", type=int, default=2000, help="most drips in any 24 hours")
+    fa.add_argument("--trust-proxy", action="store_true",
+                    help="behind a reverse proxy: rate-limit by the visitor address it forwards")
     st_ = sub.add_parser("status", help="serve a live status page (and genesis.json for joiners)")
     st_.add_argument("--genesis", required=True)
     st_.add_argument("--port", type=int, default=8080)
@@ -683,7 +687,8 @@ def main():
         print(f"wrote {args.dir}/genesis.json and {args.dir}/nodes.json")
     elif args.cmd == "faucet":
         from .testnet import fetch_genesis, serve_faucet
-        serve_faucet(fetch_genesis(args.genesis), args.key, args.port, args.amount).serve_forever()
+        serve_faucet(fetch_genesis(args.genesis), args.key, args.port, args.amount, trust_proxy=args.trust_proxy,
+                     per_day=args.per_day).serve_forever()
     elif args.cmd == "status":
         from .testnet import fetch_genesis, serve_status
         serve_status(fetch_genesis(args.genesis), args.port, public_url=args.public_url).serve_forever()

@@ -266,7 +266,9 @@ class RemoteChain:
             trusted = [(k, eps) for k, eps in votes.items() if len(eps) >= self.f + 1]
             if trusted:
                 (height, root), eps = max(trusted)
-                if root != self._root:
+                # Never step backwards: a slower set of validators can briefly report an older block, and a node
+                # that saw its view go back would redo work it already did for a later block.
+                if root != self._root and height >= self._state.height:
                     for ep in eps:
                         try:
                             r = public_request(ep, {"kind": "state"}, self.timeout)

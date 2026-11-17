@@ -129,3 +129,16 @@ jobs:
           name: logs-${{ github.job }}-${{ strategy.job-index }}
           path: net-tn/logs/
           retention-days: 7
+
+  dependencies:
+    # Fails if any dependency has a published security vulnerability.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit
+      - run: pip-audit -r requirements.txt
+

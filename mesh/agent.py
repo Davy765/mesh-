@@ -57,7 +57,10 @@ class Agent(PieceMember):
         return good[int(self.rng.choice(len(good), p=w / w.sum()))]
 
     def _call(self, addr, kind, version, arrays, train=False):
-        meta, out, ms = self.net.call(self, addr, kind, {"version": version, "train": train}, arrays)
+        req = {"version": version, "train": train}
+        if train:
+            req["round"] = self.train_round            # which round this training step is for
+        meta, out, ms = self.net.call(self, addr, kind, req, arrays)
         self.ewma[addr] = 0.7 * self.ewma.get(addr, ms) + 0.3 * ms
         rc, node = meta.get("receipt", {}), self.chain.state.nodes[addr]
         b = rc.get("body", {})
@@ -196,6 +199,7 @@ class Agent(PieceMember):
         hs, z0, _, ends = self.forward(xb, v, route="spread")
         self.last_loss, _, g_head, g = loss_and_head_grads(ends, hs[-1], yb)
         self.round_inputs = {}
+        self.train_round = self.chain.state.round
         for i in reversed(range(self.spec.n_slices)):
             g = self.train_hop(f"slice{i}", v[f"slice{i}"], hs[i], g)
         self.add_contribution(clip({**g_head, **embed_grads(xb, z0, g)}, self.C))

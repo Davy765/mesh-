@@ -201,6 +201,14 @@ class SliceServer(PieceMember):
             grads, g_in = {k: self._jitter(v) for k, v in grads.items()}, self._jitter(g_in)
             inp = input_fingerprint(h, g)
             if meta.get("train"):
+                r = meta.get("round")
+                if isinstance(r, int) and r > self._at_round:
+                    # The agent is in a newer round than I've noticed. After a rejected round the weights don't
+                    # change, so I can miss that a round ended: look again before deciding.
+                    getattr(self.chain, "refresh", lambda: None)()
+                    self.catch_up()
+                if isinstance(r, int) and r != self._at_round:
+                    raise Rejected("not at that round yet")             # the agent retries shortly
                 if meta["version"] != self.version:
                     raise Rejected("training only on the current version")
                 prev = self.contribs.get(sender)

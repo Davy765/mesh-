@@ -9,8 +9,13 @@ tokens and don't let people train on sensitive data. See [SECURITY.md](../SECURI
 - **4 small cloud servers** for validators (1 vCPU, 1–2 GB RAM is enough for the toy task), ideally from different
   providers or regions. 4 is the minimum: the chain then keeps working with 1 validator down or dishonest.
 - One of them (or a fifth) also runs the **status page** and the **faucet**.
-- Each server needs a public IP, Python 3.10+ (or Docker), and these ports open: **9100** for the node,
-  **8080** for the status page, **8090** for the faucet.
+- Each server needs a public IP, Python 3.10+ (or Docker), and **port 9100** open for the node.
+- The status/faucet server also needs **ports 80 and 443** open (HTTPS, below) and two domain names pointed at it,
+  for example `status.yourdomain` and `faucet.yourdomain`. Keep 8080 and 8090 closed to the internet: Caddy serves
+  them over HTTPS.
+- A firewall that allows only those ports, for example:
+  `sudo ufw default deny incoming && sudo ufw allow 22/tcp && sudo ufw allow 9100/tcp && sudo ufw enable`
+  (and `sudo ufw allow 80,443/tcp` on the status/faucet server).
 
 ## 1. On each validator server
 
@@ -57,14 +62,18 @@ On the status/faucet server:
 
 ```bash
 python -m mesh.run status --genesis /var/lib/mesh/net/genesis.json --port 8080 \
-    --public-url http://STATUS_HOST:8080/genesis.json &
-python -m mesh.run faucet --genesis /var/lib/mesh/net/genesis.json --key faucet.key --port 8090 &
+    --public-url https://status.yourdomain/genesis.json &
+python -m mesh.run faucet --genesis /var/lib/mesh/net/genesis.json --key faucet.key --port 8090 --trust-proxy &
 ```
 
-(Or run each as a systemd service the same way.) Open `http://STATUS_HOST:8080` to watch the network.
+(Or run each as a systemd service the same way.) Then put them behind HTTPS with [Caddy](https://caddyserver.com):
+edit the two domains in [deploy/Caddyfile](Caddyfile) and run `sudo caddy run --config deploy/Caddyfile` (or install
+it as a service). Caddy gets and renews certificates by itself. `--trust-proxy` makes the faucet rate-limit by the
+visitor's real address, which Caddy forwards; only use it behind a proxy. Open `https://status.yourdomain` to watch
+the network.
 
-With Docker instead of a Python install, prefix any command with
-`docker run --rm -v /var/lib/mesh:/var/lib/mesh -p 9100:9100 mesh` after `docker build -t mesh .`.
+With Docker instead of a Python install, build once with `docker build -t mesh .`, then run each node as
+`docker run -d --restart unless-stopped -v /var/lib/mesh:/var/lib/mesh -p 9100:9100 mesh node --dir /var/lib/mesh/net --name validator0`.
 
 ## 5. Tell people how to join
 
@@ -72,7 +81,7 @@ Anyone with a computer that others can reach (a public IP or an open port) can j
 
 ```bash
 git clone https://github.com/Davy765/mesh- && cd mesh- && pip install -r requirements.txt
-python -m mesh.run join --genesis http://STATUS_HOST:8080/genesis.json --faucet http://FAUCET_HOST:8090 \
+python -m mesh.run join --genesis https://status.yourdomain/genesis.json --faucet https://faucet.yourdomain \
     --name YOUR_NAME --role server --piece slice0 --endpoint YOUR_PUBLIC_IP:9100 --listen 0.0.0.0:9100
 ```
 

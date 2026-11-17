@@ -64,11 +64,14 @@ fit for anything of real value** (see [SECURITY.md](../SECURITY.md)).
 - **Consensus:** time-slot rotation is not a full BFT protocol (no formal view change; equivocation is prevented by
   quorum signatures in practice, not by a proof).
 - **Economics:** prices, stakes, slashing and rewards have never been simulated against rational attackers.
-- **Denial of service:** no rate limits on most node endpoints; large messages are capped at 64 MB but a flood of
-  requests could still overload a node.
+- **Denial of service:** nodes cap open connections (1,024) and requests being processed (64), drop slow senders
+  after 15 s, rate-limit each address, and bound the transaction queue; malformed input is refused without crashing
+  (tests/test_hardening.py). A large distributed flood can still exhaust a node's network or CPU: put public endpoints
+  behind a provider firewall or DDoS protection if that matters.
 - **Faucet:** it's a centralised convenience for test networks, limited per address and IP, and easy to drain with
   many addresses.
-- **Code quality for security:** no fuzzing, no static analysis beyond flake checks, no independent review.
+- **Code quality for security:** fuzz-style tests for message and transaction handling, CodeQL scanning and
+  pip-audit in CI, but no coverage-guided fuzzing and no independent review.
 
 ## Before Mesh could handle anything of real value
 

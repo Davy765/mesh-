@@ -23,23 +23,60 @@ from .crypto import Identity
 ADDRESS = re.compile(r"^[0-9a-f]{40}$")
 
 
+SECURITY_HEADERS = {
+    # The status page uses no scripts, no external resources and only inline styles.
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; "
+                               "base-uri 'none'; form-action 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Resource-Policy": "same-origin",
+}
+
+
 def _json_reply(handler, code, obj, ctype="application/json"):
     body = obj if isinstance(obj, bytes) else json.dumps(obj).encode()
     handler.send_response(code)
     handler.send_header("Content-Type", ctype)
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
+    for k, v in SECURITY_HEADERS.items():
+        handler.send_header(k, v)
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def _client_ip(handler, trust_proxy):
+    """The visitor's address. Behind a reverse proxy (Caddy, nginx) every request comes from the proxy, so
+    with --trust-proxy we take the address the proxy recorded (the last X-Forwarded-For entry)."""
+    if trust_proxy:
+        fwd = handler.headers.get("X-Forwarded-For", "")
+        if fwd:
+            return fwd.split(",")[-1].strip()
+    return handler.client_address[0]
+
+
+def _web_server(host, port, handler_cls):
+    """A threaded HTTP server with the same limits as the nodes: capped concurrency, per-address rate,
+    timeouts for slow clients."""
+    from .transport import SOCKET_TIMEOUT_S, _LimitedServerMixin, _Limits
+
+    class Server(_LimitedServerMixin, http.server.ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+        limits = _Limits()
+    handler_cls.timeout = SOCKET_TIMEOUT_S
+    return Server((host, port), handler_cls)
 
 
 # ---------------------------------------------------------------- faucet
 class Faucet:
     """Hands out test tokens: once per address, and a few times per hour per client IP."""
 
-    def __init__(self, genesis, ident, amount=1500, per_ip_per_hour=5):
+    def __init__(self, genesis, ident, amount=1500, per_ip_per_hour=5, per_day=2000):
         self.chain, self.id = RemoteChain(genesis), ident
-        self.amount, self.per_ip = amount, per_ip_per_hour
+        self.amount, self.per_ip, self.per_day = amount, per_ip_per_hour, per_day
+        self.day_log = []                      # every drip in the last 24 hours (caps the total)
         self.given, self.ip_log = set(), {}
         self.lock = threading.Lock()
         self.nonce, self.last_submit = 0, 0.0
@@ -57,21 +94,27 @@ class Faucet:
         with self.lock:
             now = time.time()
             hits = [t for t in self.ip_log.get(ip, []) if now - t < 3600]
+            self.day_log = [t for t in self.day_log if now - t < 86400]
             if address in self.given:
                 return 429, {"error": "this address already got tokens"}
             if len(hits) >= self.per_ip:
                 return 429, {"error": "too many requests from your IP; try again later"}
+            if len(self.day_log) >= self.per_day:
+                return 429, {"error": "the faucet has reached today's limit; try again tomorrow"}
             if self.chain.state.balances.get(self.id.address, 0) < self.amount:
                 return 503, {"error": "the faucet is empty"}
             self.chain.submit(make_tx(self.id, "transfer", {"to": address, "amount": self.amount,
                                                             "sign_pk": self.id.sign_pk}, self._next_nonce()))
             self.given.add(address)
             self.ip_log[ip] = hits + [now]
+            self.day_log.append(now)
+            if len(self.ip_log) > 50_000:      # forget idle clients
+                self.ip_log = {k: v for k, v in self.ip_log.items() if v and now - v[-1] < 3600}
         return 200, {"sent": self.amount, "to": address, "note": "test tokens, no value"}
 
 
-def serve_faucet(genesis, key_path, port, amount=1500, host="0.0.0.0"):
-    faucet = Faucet(genesis, Identity.load(key_path), amount)
+def serve_faucet(genesis, key_path, port, amount=1500, host="0.0.0.0", trust_proxy=False, per_day=2000):
+    faucet = Faucet(genesis, Identity.load(key_path), amount, per_day=per_day)
 
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -90,10 +133,10 @@ def serve_faucet(genesis, key_path, port, amount=1500, host="0.0.0.0"):
                 address = json.loads(self.rfile.read(n)).get("address", "")
             except (ValueError, AttributeError):
                 return _json_reply(self, 400, {"error": "send JSON: {\"address\": \"...\"}"})
-            code, out = faucet.drip(address, self.client_address[0])
+            code, out = faucet.drip(address, _client_ip(self, trust_proxy))
             _json_reply(self, code, out)
 
-    srv = http.server.ThreadingHTTPServer((host, port), H)
+    srv = _web_server(host, port, H)
     print(f"faucet {faucet.id.address} giving {amount} test tokens per address on port {port}", flush=True)
     return srv
 
@@ -192,7 +235,7 @@ def serve_status(genesis, port, host="0.0.0.0", public_url=None):
             page = render_status(s, len(chain.endpoints), chain.f + 1, url).encode()
             _json_reply(self, 200, page, "text/html; charset=utf-8")
 
-    srv = http.server.ThreadingHTTPServer((host, port), H)
+    srv = _web_server(host, port, H)
     print(f"status page on port {port}", flush=True)
     return srv
 

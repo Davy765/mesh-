@@ -28,7 +28,8 @@ import urllib.request
 from .network import NodeDown, Rejected
 
 MAX_FRAME = 64 * 1024 * 1024
-MAX_CONCURRENT = int(os.environ.get("MESH_MAX_CONCURRENT", 64))      # requests handled at once per node
+MAX_CONCURRENT = int(os.environ.get("MESH_MAX_CONCURRENT", 64))      # requests being processed at once per node
+MAX_CONNECTIONS = int(os.environ.get("MESH_MAX_CONNECTIONS", 1024))   # open connections (HTTP keeps them alive)
 SOCKET_TIMEOUT_S = float(os.environ.get("MESH_SOCKET_TIMEOUT", 15))   # slow or stalled senders are dropped
 RATE_PER_IP = float(os.environ.get("MESH_RATE_PER_IP", 300))          # requests per second, per address
 RATE_BURST = 2 * RATE_PER_IP
@@ -39,7 +40,8 @@ class _Limits:
     """Shared by both carriers: a cap on concurrent requests and a token bucket per client address."""
 
     def __init__(self):
-        self.slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)      # open connections
+        self.work = threading.BoundedSemaphore(MAX_CONCURRENT)        # requests being processed
         self.buckets, self.lock = {}, threading.Lock()
 
     def allow(self, ip):
@@ -205,6 +207,16 @@ class TCPNetwork:
         return rmeta, rarrays, (time.perf_counter() - t0) * 1000
 
 
+def _answer_limited(limits, peer, public_handler, kind, payload):
+    """Process one request if there's capacity within a few seconds; otherwise return None (busy)."""
+    if not limits.work.acquire(timeout=5):
+        return None
+    try:
+        return _answer(peer, public_handler, kind, payload)
+    finally:
+        limits.work.release()
+
+
 def _answer(peer, public_handler, kind, payload):
     """Shared by both carriers: returns the reply payload. Never raises, whatever a stranger sends."""
     if kind == b"E":
@@ -247,7 +259,10 @@ def serve(peer, host, port, public_handler=None, http_mode=False):
                     return
                 kind = {"/e": b"E", "/p": b"P"}.get(self.path.rstrip("/")[-2:])
                 body = self.rfile.read(n)
-                reply = _answer(peer, public_handler, kind, body) if kind else b""
+                reply = _answer_limited(self.server.limits, peer, public_handler, kind, body) if kind else b""
+                if reply is None:
+                    self.send_error(503, "busy")
+                    return
                 self.send_response(200 if kind else 404)
                 self.send_header("Content-Type", "application/octet-stream")
                 self.send_header("Content-Length", str(len(reply)))
@@ -265,7 +280,9 @@ def serve(peer, host, port, public_handler=None, http_mode=False):
             def handle(self):
                 try:
                     kind, payload = recv_frame(self.request)
-                    send_frame(self.request, kind, _answer(peer, public_handler, kind, payload))
+                    reply = _answer_limited(self.server.limits, peer, public_handler, kind, payload)
+                    if reply is not None:                  # busy: close without a reply; the caller retries
+                        send_frame(self.request, kind, reply)
                 except (OSError, ConnectionError, struct.error):
                     pass
 
