@@ -27,7 +27,7 @@ Two prototypes in Python (needs `numpy` and `cryptography`: `pip install -r requ
 | **Swarm** (`swarm/`) | Peers learn one model together by gossiping weights. Simple and small. | `python simulate.py` |
 | **Mesh** (`mesh/`) | One model **split across many servers**, trained by agents with private data, coordinated and paid through a **small blockchain**, with defences against cheating. | `python simulate_mesh.py` |
 
-Tests: `python -m unittest discover -s tests` (32 tests, about 25 s). They also run automatically on every pull request.
+Tests: `python -m unittest discover -s tests` (35 tests, about 30 s). They also run automatically on every pull request.
 
 ---
 
@@ -134,6 +134,23 @@ In a 24-round run, accuracy reached 94.3%, the restarted validator caught up to 
 others, the restarted server resynced and earned rewards again, and no node errors were logged. GitHub runs a
 shorter version of this, over TCP and HTTP, on every pull request.
 
+### A public test network
+
+Everything needed to run Mesh as an always-on network that anyone can join, with play-money tokens:
+
+- **`python -m mesh.run join`**: creates your key locally, gets test tokens from the faucet, registers, downloads
+  the current weights and takes part, as a slice server, an agent or a validator.
+- **Validators can join and leave:** they stake 1,000 test tokens and enter (or leave) the set at the next epoch
+  boundary (every 50 blocks); the set never drops below 4.
+- **Faucet** (`mesh.run faucet`) for test tokens, and a **live status page** (`mesh.run status`).
+- **Deployment kit:** a Dockerfile, a systemd unit, and a step-by-step guide:
+  [deploy/TESTNET.md](deploy/TESTNET.md).
+
+Rehearse it on one machine: `python -m mesh.run local --testnet --rounds 20` runs the network with a faucet and a
+status page, and partway through a new agent and a new validator join from scratch. In a test run the new validator
+entered the set (8 validators, quorum 6), the new agent trained alongside the others, and no node logged an error.
+Running it for real needs a few always-on servers (about 4 small cloud servers); see the guide.
+
 ### Running on several real machines (GitHub + Tailscale)
 
 The `multi-machine` workflow starts three separate GitHub machines, joins them into a private
@@ -157,8 +174,7 @@ address the others reach this machine at, `--coordinator` is machine 0's address
 
 ### Not built yet
 
-- **Validators joining or leaving** (the set is fixed at genesis) and a full BFT protocol instead of
-  time-slot leader rotation.
+- **A full BFT protocol** instead of time-slot leader rotation. (Validators can now join and leave.)
 - **A colluding majority of one slice's replicas.** With 3 replicas, 2 colluding servers can poison that slice
   undetected. More replicas per slice raise the bar but cost more computing.
 - **Hiding who talks to whom.** Traffic is encrypted, but its size and pattern are visible.
@@ -178,6 +194,8 @@ address the others reach this machine at, `--coordinator` is machine 0's address
 | `mesh/agent.py` | Agent: routing, failover, spot checks, training, voting, job market |
 | `mesh/sim.py` | Builds a whole network in one process, with optional attackers; the public seed set |
 | `mesh/datasets.py` | MNIST download (checksum-verified) and the per-class split |
+| `mesh/testnet.py` | Faucet, status page and joining a running network |
+| `deploy/`, `Dockerfile` | Deployment kit and guide for a public test network |
 | `mesh/transport.py`, `mesh/chain_net.py`, `mesh/run.py` | Real networking (TCP or HTTP), networked validators with saved blocks and a light client, key generation, one-process-per-node runner |
 
 ---
