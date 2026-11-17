@@ -13,7 +13,7 @@ from .aggregate import clip, dp_release
 from .crypto import sha
 from .member import PieceMember
 from .model import output_hash, param_hash, quantize, slice_backward, slice_forward
-from .network import NodeDown, Rejected
+from .network import NodeDown, Rejected, check_array
 
 
 def input_fingerprint(h, g):
@@ -91,7 +91,12 @@ class SliceServer(PieceMember):
                 _, arrays, _ = self.net.call(self, addr, kind, meta)
             except (NodeDown, Rejected):
                 continue
-            if "h" not in arrays or input_fingerprint(arrays["h"], arrays["g"]) != want:
+            try:                                           # a wrong-shaped input would crash every replica the
+                h = check_array(arrays.get("h"), 2, cols=self.spec.hidden)   # same way: skip it instead
+                g = check_array(arrays.get("g"), 2, cols=self.spec.hidden)
+            except Rejected:
+                continue
+            if len(h) != len(g) or input_fingerprint(arrays["h"], arrays["g"]) != want:
                 continue
             grads, _ = slice_backward(self.params, arrays["h"], arrays["g"])
             grads = {k: self._jitter(v) for k, v in grads.items()}
@@ -183,12 +188,15 @@ class SliceServer(PieceMember):
         params = self.params_for(meta["version"])
         self.served += 1
         if kind == "fwd":
-            h = arrays["h"]
+            h = check_array(arrays.get("h"), 2, cols=self.spec.hidden)
             out = self._maybe_lie(self._jitter(slice_forward(params, h)))
             ms = 2 + self.compute_ms_per_item * len(h)
             return {"receipt": self.receipt("fwd", meta["version"], output_hash(h), out)}, {"out": out}, ms
         if kind == "bwd":
-            h, g = arrays["h"], arrays["g"]
+            h = check_array(arrays.get("h"), 2, cols=self.spec.hidden)
+            g = check_array(arrays.get("g"), 2, cols=self.spec.hidden)
+            if len(h) != len(g):
+                raise Rejected("malformed array")
             grads, g_in = slice_backward(params, h, g)
             grads, g_in = {k: self._jitter(v) for k, v in grads.items()}, self._jitter(g_in)
             inp = input_fingerprint(h, g)

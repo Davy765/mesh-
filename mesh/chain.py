@@ -95,6 +95,28 @@ class State:
         del self.events[:-self.params.get("history_keep", 500)]
 
     # ---- transactions ----------------------------------------------------------
+    def precheck(self, tx):
+        """Cheap checks a validator runs before accepting a transaction into its queue from the open
+        network: well-formed, correctly signed, and a plausible transaction number. Returns None if OK."""
+        try:
+            if not isinstance(tx, dict) or not isinstance(tx.get("type"), str) or not isinstance(tx.get("body"), dict):
+                return "malformed"
+            sender, nonce = tx["sender"], tx["nonce"]
+            if not isinstance(sender, str) or len(sender) != 40 or not isinstance(nonce, int) or isinstance(nonce, bool):
+                return "malformed"
+            signed = {k: tx[k] for k in ("type", "sender", "nonce", "body")}
+            pk = self.nodes.get(sender, {}).get("sign_pk") or \
+                next((v["sign_pk"] for v in self.validators if v["address"] == sender), None) or \
+                tx["body"].get("sign_pk")
+            if not isinstance(pk, str) or address_of(pk) != sender or not verify_obj(pk, tx.get("sig", ""), signed):
+                return "bad signature"
+            current = self.nonces.get(sender, 0)
+            if nonce < current or nonce > current + 64:
+                return "transaction number out of range"
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return "malformed"
+        return None
+
     def apply(self, tx):
         """Apply one transaction. Returns None on success or a reason string (tx is then a no-op,
         except that a correctly signed tx with the right nonce still uses up its nonce)."""
@@ -109,16 +131,21 @@ class State:
             return "malformed"
         if not pk or address_of(pk) != sender or not verify_obj(pk, tx.get("sig", ""), signed):
             return "bad signature"
-        if tx["nonce"] != self.nonces.get(sender, 0):
+        if not isinstance(tx["nonce"], int) or isinstance(tx["nonce"], bool) or tx["nonce"] != self.nonces.get(sender, 0):
             return "bad nonce"
         self.nonces[sender] = tx["nonce"] + 1
         handler = getattr(self, "_tx_" + tx["type"], None)
         if handler is None:
             return "unknown tx type"
+        if not isinstance(body, dict):
+            return "invalid body"
+        snapshot = copy.deepcopy(self.to_obj())
         try:
             return handler(sender, body)
-        except (KeyError, TypeError, ValueError) as e:
-            return f"invalid body: {e}"
+        except Exception as e:                # never let one bad transaction stop block production: undo any
+            for k, v in snapshot.items():     # partial change and record it as failed (same on every validator)
+                setattr(self, k, v)
+            return f"invalid body: {type(e).__name__}"
 
     def _tx_transfer(self, s, b):
         """Send tokens. On a test network this is how a faucet hands out play money."""

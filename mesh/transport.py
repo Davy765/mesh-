@@ -28,6 +28,56 @@ import urllib.request
 from .network import NodeDown, Rejected
 
 MAX_FRAME = 64 * 1024 * 1024
+MAX_CONCURRENT = int(os.environ.get("MESH_MAX_CONCURRENT", 64))      # requests handled at once per node
+SOCKET_TIMEOUT_S = float(os.environ.get("MESH_SOCKET_TIMEOUT", 15))   # slow or stalled senders are dropped
+RATE_PER_IP = float(os.environ.get("MESH_RATE_PER_IP", 300))          # requests per second, per address
+RATE_BURST = 2 * RATE_PER_IP
+LOCAL_ADDRS = {"127.0.0.1", "::1"}                                     # exempt: one-machine demos and tests
+
+
+class _Limits:
+    """Shared by both carriers: a cap on concurrent requests and a token bucket per client address."""
+
+    def __init__(self):
+        self.slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+        self.buckets, self.lock = {}, threading.Lock()
+
+    def allow(self, ip):
+        if ip in LOCAL_ADDRS:
+            return True
+        now = time.monotonic()
+        with self.lock:
+            tokens, last = self.buckets.get(ip, (RATE_BURST, now))
+            tokens = min(RATE_BURST, tokens + (now - last) * RATE_PER_IP)
+            if tokens < 1:
+                self.buckets[ip] = (tokens, now)
+                return False
+            self.buckets[ip] = (tokens - 1, now)
+            if len(self.buckets) > 10_000:                    # forget idle clients
+                self.buckets = {k: v for k, v in self.buckets.items() if now - v[1] < 60}
+            return True
+
+
+class _LimitedServerMixin:
+    """Refuse (close) a connection at once when the node is at capacity or the client is over its rate,
+    instead of starting yet another thread for it."""
+
+    def process_request(self, request, client_address):
+        if not self.limits.allow(client_address[0]) or not self.limits.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            request.settimeout(SOCKET_TIMEOUT_S)
+            super().process_request(request, client_address)
+        except Exception:
+            self.limits.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.limits.slots.release()
 
 
 def send_frame(sock, kind, payload):
@@ -156,18 +206,23 @@ class TCPNetwork:
 
 
 def _answer(peer, public_handler, kind, payload):
-    """Shared by both carriers: returns the reply payload."""
+    """Shared by both carriers: returns the reply payload. Never raises, whatever a stranger sends."""
     if kind == b"E":
         try:
             reply, _ = peer.receive(payload)
-        except Rejected:
-            reply = b""                         # forged / tampered / unknown: say nothing useful
+        except Exception:
+            reply = b""                         # forged / tampered / malformed / unknown: say nothing useful
         return reply
     if kind == b"P" and public_handler:
         try:
-            out = public_handler(json.loads(payload))
-        except (Rejected, KeyError, ValueError, TypeError) as e:
+            req = json.loads(payload)
+            if not isinstance(req, dict):
+                raise ValueError("expected a JSON object")
+            out = public_handler(req)
+        except Rejected as e:
             out = {"error": str(e)}
+        except Exception:
+            out = {"error": "bad request"}
         return json.dumps(out).encode()
     return b""
 
@@ -177,13 +232,17 @@ def serve(peer, host, port, public_handler=None, http_mode=False):
     if http_mode:
         class HTTPHandler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"         # keep connections open
+            timeout = SOCKET_TIMEOUT_S            # drop slow or stalled senders
 
             def log_message(self, *a):
                 pass
 
             def do_POST(self):
-                n = int(self.headers.get("Content-Length") or 0)
-                if n > MAX_FRAME:
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    n = -1
+                if n < 0 or n > MAX_FRAME:
                     self.send_error(413)
                     return
                 kind = {"/e": b"E", "/p": b"P"}.get(self.path.rstrip("/")[-2:])
@@ -195,9 +254,10 @@ def serve(peer, host, port, public_handler=None, http_mode=False):
                 self.end_headers()
                 self.wfile.write(reply)
 
-        class HTTPServer(http.server.ThreadingHTTPServer):
+        class HTTPServer(_LimitedServerMixin, http.server.ThreadingHTTPServer):
             daemon_threads = True
             allow_reuse_address = True
+            limits = _Limits()
 
         srv = HTTPServer((host, port), HTTPHandler)
     else:
@@ -206,12 +266,13 @@ def serve(peer, host, port, public_handler=None, http_mode=False):
                 try:
                     kind, payload = recv_frame(self.request)
                     send_frame(self.request, kind, _answer(peer, public_handler, kind, payload))
-                except (OSError, ConnectionError):
+                except (OSError, ConnectionError, struct.error):
                     pass
 
-        class Server(socketserver.ThreadingTCPServer):
+        class Server(_LimitedServerMixin, socketserver.ThreadingTCPServer):
             daemon_threads = True
             allow_reuse_address = True
+            limits = _Limits()
 
         srv = Server((host, port), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()

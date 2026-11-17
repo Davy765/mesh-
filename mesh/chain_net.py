@@ -17,7 +17,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from .chain import State, Validator
+from .chain import State, Validator, tx_hash
+
+MEMPOOL_MAX = 5000                      # transactions waiting for a block; more are refused until there's room
 from .crypto import canon, sha
 from .network import NodeDown, Peer, Rejected
 from .transport import TCPNetwork, public_request, serve
@@ -35,6 +37,7 @@ class ValidatorNode(Peer):
         self.lock = threading.RLock()
         self.net = TCPNetwork(self._directory, timeout_ms=interval * 400)
         self.refused = 0
+        self._queued = set()                 # hashes of transactions in my queue (to ignore duplicates)
 
     @property
     def vals(self):
@@ -60,7 +63,21 @@ class ValidatorNode(Peer):
         kind = req.get("kind")
         with self.lock:
             if kind == "tx":
-                self.v.mempool.append(req["tx"])
+                tx = req.get("tx")
+                problem = self.v.state.precheck(tx)
+                if problem:
+                    raise Rejected(problem)
+                h = tx_hash(tx)
+                if len(self._queued) > 2 * len(self.v.mempool) + 1000:      # drop hashes of included txs
+                    self._queued = {tx_hash(t) for t in self.v.mempool}
+                if h in self._queued:
+                    return {"ok": True, "duplicate": True}
+                if len(self.v.mempool) >= MEMPOOL_MAX:
+                    raise Rejected("busy: transaction queue full, try again shortly")
+                if sum(1 for t in self.v.mempool if t.get("sender") == tx["sender"]) >= 64:
+                    raise Rejected("too many queued transactions from this sender")
+                self.v.mempool.append(tx)
+                self._queued.add(h)
                 return {"ok": True}
             if kind == "head":
                 return {"height": self.v.state.height, "root": self.v.state.root()}

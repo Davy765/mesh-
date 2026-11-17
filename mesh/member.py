@@ -207,8 +207,11 @@ class PieceMember(Peer):
         if kind == "reveal":
             if sender not in st.members(self.piece) or meta["round"] != st.round:
                 raise Rejected("not a holder of this piece")
+            if set(arrays) != set(self.params) or any(
+                    np.shape(arrays[k]) != self.params[k].shape or not np.isfinite(arrays[k]).all() for k in arrays):
+                raise Rejected("update has the wrong shape")       # would otherwise crash aggregation later
             with self.lock:
-                self.reveals[sender] = ({k: np.asarray(v, float) for k, v in arrays.items()}, meta["salt"])
+                self.reveals[sender] = ({k: np.asarray(v, float) for k, v in arrays.items()}, str(meta["salt"]))
             return {}, {}, 1.0
         if kind == "fetch":
             if sender not in st.members(self.piece):

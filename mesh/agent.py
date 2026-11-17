@@ -9,7 +9,7 @@ from .aggregate import clip, cosine
 from .crypto import canon, merkle_root, sha, verify_obj
 from .member import PieceMember
 from .model import embed, embed_grads, head, loss_and_head_grads, output_hash
-from .network import NodeDown, Rejected
+from .network import NodeDown, Rejected, check_array
 from .server import input_fingerprint
 
 
@@ -307,7 +307,7 @@ class Agent(PieceMember):
     def work_chunk(self, job, chunk, microbatches=4):
         j = self.chain.state.jobs[job]
         _, arrays, _ = self.net.call(self, j["poster"], "job_data", {"job": job, "chunk": chunk})
-        X = arrays["x"]
+        X = check_array(arrays.get("x"), 2, cols=self.spec.d_in, max_rows=10_000)
         if output_hash(X) != j["chunks"][chunk]["input"]:
             raise Rejected("poster sent data that doesn't match the job")
         labels, timing = self.infer(X, microbatches)
@@ -369,14 +369,16 @@ class Agent(PieceMember):
                 raise Rejected("not your chunk")
             return {}, {"x": self.my_jobs[meta["job"]][meta["chunk"]]}, 1.0
         if kind == "job_result":
-            rc, labels = meta["receipt"], arrays["labels"]
+            rc, labels = meta["receipt"], arrays.get("labels")
+            if not isinstance(labels, np.ndarray) or labels.ndim != 1 or labels.dtype.kind not in "iu":
+                raise Rejected("malformed labels")
             if rc["body"]["by"] != sender or rc["body"]["output"] != sha(np.asarray(labels, np.int64).tobytes()) \
                     or not verify_obj(node["sign_pk"], rc["sig"], rc["body"]):
                 raise Rejected("result does not match its receipt")
             self.job_results[(meta["job"], meta["chunk"])] = (labels, rc)
             return {}, {}, 1.0
         if kind == "job_attest":
-            X = arrays["x"]
+            X = check_array(arrays.get("x"), 2, cols=self.spec.d_in, max_rows=10_000)
             labels, t = self.infer(X)
             if self.behaviour == "poisoner":
                 labels = self.rng.integers(0, self.spec.n_classes, len(labels))
