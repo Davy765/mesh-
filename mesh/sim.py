@@ -1,4 +1,6 @@
 """Builds a whole network in one process: validators, slice servers and agents, plus adversaries."""
+import contextlib
+
 import numpy as np
 
 from swarm.data import make_dataset, split_non_iid
@@ -96,23 +98,29 @@ class World:
     def members(self):
         return list(self.servers.values()) + self.agents
 
-    def round(self):
+    def round(self, guard=None):
+        """One training round. `guard` (a lock) is held around each step rather than the whole round,
+        so something else, such as the playground answering visitors, can use the network in between."""
+        guard = guard or contextlib.nullcontext()
+
+        def each(nodes, step):
+            for n in nodes:
+                with guard:
+                    getattr(n, step)()
+
+        def block():
+            with guard:
+                self.chain.produce_block()
         assert self.chain.state.phase == "commit"
-        for a in self.agents:
-            a.train_step()
-        for m in self.members:
-            m.phase_commit()
-        self.chain.produce_block()            # -> reveal
-        for m in self.members:
-            m.phase_reveal()
-        for m in self.members:
-            m.phase_candidate()
-        self.chain.produce_block()            # -> vote
-        for a in self.agents:
-            a.phase_vote()
-        self.chain.produce_block()            # -> finalize, next round
-        for m in self.members:
-            m.phase_finalize()
+        each(self.agents, "train_step")
+        each(self.members, "phase_commit")
+        block()                               # -> reveal
+        each(self.members, "phase_reveal")
+        each(self.members, "phase_candidate")
+        block()                               # -> vote
+        each(self.agents, "phase_vote")
+        block()                               # -> finalize, next round
+        each(self.members, "phase_finalize")
         return self.chain.state.history[-1] if self.chain.state.history else None
 
     def canonical_model(self):

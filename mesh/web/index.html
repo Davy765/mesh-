@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mesh Playground</title>
+<meta name="description" content="Draw a digit and watch a model that no single computer holds recognise it.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><img src="/favicon.svg" alt="" width="28" height="28"><span>Mesh Playground</span></div>
+  <div class="pill" id="net-pill"><span class="dot"></span><span id="net-text">connecting…</span></div>
+</header>
+
+<main>
+  <section class="intro">
+    <h1 id="headline">Draw a digit. A model split across many computers will read it.</h1>
+    <p id="subline">No single machine holds this model. Your drawing passes through slices held by
+      independent servers, which check each other's work and are paid only for honest answers.</p>
+  </section>
+
+  <div class="grid">
+    <section class="card" aria-labelledby="pad-title">
+      <div class="card-head">
+        <h2 id="pad-title">Your input</h2>
+        <div class="actions">
+          <button type="button" id="sample-btn" class="ghost">Try a test digit</button>
+          <button type="button" id="clear-btn" class="ghost">Clear</button>
+        </div>
+      </div>
+      <div class="pad-wrap">
+        <canvas id="pad" width="280" height="280" aria-label="Drawing pad"></canvas>
+        <p class="pad-hint" id="pad-hint">Draw a digit from 0 to 9 here</p>
+      </div>
+      <p class="muted small" id="pad-note">Draw big and in the middle, like on paper.</p>
+    </section>
+
+    <section class="card" aria-labelledby="answer-title" aria-live="polite">
+      <div class="card-head"><h2 id="answer-title">What the model thinks</h2></div>
+      <div class="answer">
+        <div class="big" id="big">?</div>
+        <div class="answer-text">
+          <div id="answer-line" class="answer-line">Waiting for your drawing</div>
+          <div id="answer-sub" class="muted small"></div>
+        </div>
+      </div>
+      <div class="bars" id="bars"></div>
+      <h3>How your request travelled</h3>
+      <ol class="route" id="route"><li class="muted small">The path appears after the first answer.</li></ol>
+    </section>
+  </div>
+
+  <section class="card" aria-labelledby="net-title">
+    <div class="card-head"><h2 id="net-title">The network right now</h2></div>
+    <div class="stats" id="stats"></div>
+    <div class="chart-wrap">
+      <div class="muted small">Share of test digits it gets right, as training goes on</div>
+      <svg id="chart" viewBox="0 0 600 160" role="img" aria-label="Accuracy over training rounds"></svg>
+    </div>
+    <h3>Who holds the model</h3>
+    <div class="nodes" id="nodes"></div>
+    <p class="muted small" id="legend"></p>
+  </section>
+
+  <section class="card faq" aria-labelledby="faq-title">
+    <h2 id="faq-title">Good to know</h2>
+    <details><summary>What can this model do?</summary>
+      <p id="faq-what">It recognises handwritten digits, 0 to 9. That is all. It is a small network trained on a public
+        set of handwritten digits (MNIST). It is not a chatbot, and it does not read or learn from websites.</p></details>
+    <details><summary>Does it learn from my drawing?</summary>
+      <p>No. Your drawing is used to answer you and then thrown away. The model only learns from the training
+        data its agents hold, and every update is voted on by the network before it is used.</p></details>
+    <details><summary>Why is it sometimes wrong?</summary>
+      <p>It is small and still learning, and drawings on a screen look a bit different from the scanned
+        handwriting it learned from. Watch the accuracy chart: it improves as training rounds are accepted.</p></details>
+    <details><summary>What does "ejected for cheating" mean?</summary>
+      <p>Some nodes may cheat: on the demo network a few do so on purpose (they have "liar", "poisoner" or
+        "cheater" in their names). Spot checks catch servers that return wrong answers, and voting throws out
+        poisoned updates. A caught cheater loses half its stake and is removed from the network.</p></details>
+  </section>
+</main>
+
+<footer class="foot muted small">
+  Mesh is an open-source experiment. Test network tokens are play money.
+  <a href="https://github.com/Davy765/mesh-" rel="noopener">Source on GitHub</a>
+</footer>
+</body>
+</html>

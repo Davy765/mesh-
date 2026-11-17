@@ -74,8 +74,9 @@ class Agent(PieceMember):
         self.work[addr] = self.work.get(addr, 0) + units
         self.receipts.append(sha(canon(rc)))
 
-    def run_hop(self, piece, kind, version, arrays, train=False, route="fast"):
-        """One hop through a slice, with failover and random spot checks. Returns (output, ms)."""
+    def run_hop(self, piece, kind, version, arrays, train=False, route="fast", trace=None):
+        """One hop through a slice, with failover and random spot checks. Returns (output, ms).
+        If `trace` is a list, a record of who answered is appended to it (for the playground)."""
         ms_total, tried, sweeps, why = 0.0, set(), 0, {}
         for _ in range(24):                        # enough for every replica on every retry below
             try:
@@ -106,8 +107,12 @@ class Agent(PieceMember):
                 continue
             ms_total += ms
             self._pay(addr, rc)
-            if self.rng.random() < self.spot_check:
+            checked, caught_before = self.rng.random() < self.spot_check, self.stats["caught"]
+            if checked:
                 out = self.spot_check_hop(piece, kind, version, arrays, addr, out, rc)
+            if trace is not None:
+                trace.append({"piece": piece, "server": addr, "ms": round(ms, 1), "failovers": len(why),
+                              "spot_checked": bool(checked), "caught_liar": self.stats["caught"] > caught_before})
             self.stats[f"hops_{route}"] += 1
             self.stats[f"ms_{route}"] += ms
             return out, ms_total
@@ -158,14 +163,15 @@ class Agent(PieceMember):
     def model_version(self):
         return sha(canon(self.versions("current")))
 
-    def forward(self, X, versions, route="fast", private=True):
+    def forward(self, X, versions, route="fast", private=True, trace=None):
         ends = self.params_for(versions["ends"])
         h0, z0 = embed(ends, X)
         if self.activation_noise and private:      # servers only ever see noised hidden features
             h0 = h0 + self.rng.normal(0, self.activation_noise, h0.shape)
         hs, hop_ms = [h0], []
         for i in range(self.spec.n_slices):
-            out, ms = self.run_hop(f"slice{i}", "fwd", versions[f"slice{i}"], {"h": hs[-1]}, route=route)
+            out, ms = self.run_hop(f"slice{i}", "fwd", versions[f"slice{i}"], {"h": hs[-1]}, route=route,
+                                   trace=trace)
             hs.append(out)
             hop_ms.append(ms)
         return hs, z0, hop_ms, ends

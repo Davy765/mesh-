@@ -250,7 +250,7 @@ def fetch_genesis(source):
 
 
 def join(genesis_src, name, role, endpoint, d, piece=None, index=None, faucet=None, listen=None, rounds=None,
-         wait_s=300):
+         wait_s=300, ui_port=None, trust_proxy=False):
     """Create (or reuse) this node's key, get test tokens if needed, and run it on the network."""
     from . import run as runner
     genesis = fetch_genesis(genesis_src)
@@ -293,4 +293,4 @@ def join(genesis_src, name, role, endpoint, d, piece=None, index=None, faucet=No
     if index is not None:
         card["index"] = int(index)
     print(f"{name} ({ident.address}) joining as {role}", flush=True)
-    runner.run_member(d, genesis, card, ident, rounds)
+    runner.run_member(d, genesis, card, ident, rounds, ui_port=ui_port, trust_proxy=trust_proxy)

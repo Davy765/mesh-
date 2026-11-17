@@ -14,6 +14,7 @@ Across several machines, private keys never leave the machine that owns them:
 `init` is a demo shortcut that does keygen + genesis for a whole network on one machine.
 """
 import argparse
+import contextlib
 import glob
 import json
 import os
@@ -123,17 +124,18 @@ def load(d):
 
 
 # ---------------------------------------------------------------- one node
-def run_node(d, name, rounds=None, key_path=None):
+def run_node(d, name, rounds=None, key_path=None, ui_port=None, trust_proxy=False):
     genesis, nodes = load(d)
     nd = next(n for n in nodes if n["name"] == name)
     ident = Identity.load(key_path or os.path.join(d, "keys", f"{name}.key"))
     if ident.sign_pk != nd["sign_pk"]:
         raise SystemExit(f"{name}: this key file does not match the public key in nodes.json")
-    run_member(d, genesis, nd, ident, rounds)
+    run_member(d, genesis, nd, ident, rounds, ui_port=ui_port, trust_proxy=trust_proxy)
 
 
-def run_member(d, genesis, nd, ident, rounds=None):
-    """Run one node from its card. Works for nodes listed at genesis and for nodes that join later."""
+def run_member(d, genesis, nd, ident, rounds=None, ui_port=None, trust_proxy=False):
+    """Run one node from its card. Works for nodes listed at genesis and for nodes that join later.
+    An agent given `ui_port` also serves the playground web page, answering visitors with the live model."""
     name = nd["name"]
     http_mode = is_http(nd["endpoint"])
     host, port = parse_endpoint(nd.get("listen") or (
@@ -187,6 +189,14 @@ def run_member(d, genesis, nd, ident, rounds=None):
         if chain.state.round > 0:                          # joining a network that has already trained:
             log(name, event="joining", round=chain.state.round, resynced=m.rejoin())   # get today's weights
     log(name, event="started", endpoint=nd["endpoint"], address=m.address)
+    pg, guard = None, contextlib.nullcontext()
+    if ui_port and nd["role"] == "agent":
+        from .app import Playground, VisitorsFirst, serve_app
+        guard = VisitorsFirst()              # held around each step, so visitors never land mid-step
+        pg = Playground(m, chain, genesis.get("dataset", "ring"), Xtest, ytest, "network", guard=guard,
+                        target_rounds=genesis["params"].get("lr_decay_rounds"))
+        serve_app(pg, ui_port, trust_proxy=trust_proxy)
+        log(name, event="playground", port=ui_port)
 
     I = genesis["interval"]
     seen, joined, trained_round = None, False, -1
@@ -200,29 +210,39 @@ def run_member(d, genesis, nd, ident, rounds=None):
         try:
             if st.phase == "commit":
                 if joined:
-                    m.phase_finalize()
+                    with guard:
+                        m.phase_finalize()
                     if rounds and st.round >= rounds + 3:
                         break
                 else:                                  # first round I take part in: make sure my weights
-                    m.rejoin()                         # are this round's (the network may have moved on)
+                    with guard:                        # are this round's (the network may have moved on)
+                        m.rejoin()
                 joined = True
                 if nd["role"] == "agent" and st.round > trained_round:
                     trained_round = st.round            # one training step per round, whatever the view does
                     time.sleep(0.15 * I)          # let servers switch to this round's weights first
-                    m.train_step()
-                    m.phase_commit()
-                    if name == "agent0" and st.round % 5 == 0:
-                        acc = float((m.predict(Xtest) == ytest).mean())
+                    with guard:
+                        m.train_step()
+                        m.phase_commit()
+                    if (name == "agent0" or pg) and st.round % 5 == 0:
+                        with guard:
+                            n_eval = 500 if pg and name != "agent0" else len(Xtest)
+                            acc = float((m.predict(Xtest[:n_eval]) == ytest[:n_eval]).mean())
                         log(name, event="eval", round=st.round, test_acc=acc)
+                        if pg:
+                            pg.history.append({"round": st.round, "acc": round(acc, 4)})
                 else:
                     time.sleep(max(0.0, t0 + 0.6 * I - time.time()))
                     m.phase_commit()
             elif st.phase == "reveal" and joined:
-                m.phase_reveal()
+                with guard:
+                    m.phase_reveal()
                 time.sleep(max(0.0, t0 + 0.5 * I - time.time()))
-                m.phase_candidate()
+                with guard:
+                    m.phase_candidate()
             elif st.phase == "vote" and joined and nd["role"] == "agent":
-                m.phase_vote()
+                with guard:
+                    m.phase_vote()
                 s = m.stats
                 log(name, event="round", round=st.round, loss=m.last_loss, failovers=s["failovers"],
                     checks=s["checks"], caught=s["caught"],
@@ -239,7 +259,7 @@ def _report_validator(v, name, stop):
 
 
 # ---------------------------------------------------------------- everything locally
-def local(rounds, interval, attackers, base_port, d, dataset="ring", http=False, testnet=False):
+def local(rounds, interval, attackers, base_port, d, dataset="ring", http=False, testnet=False, ui_port=None):
     marker = os.path.join(d, ".mesh-local")
     if os.path.exists(d) and os.listdir(d) and not os.path.exists(marker):
         raise SystemExit(f"{d} exists and was not made by `local`; pick another --dir")
@@ -253,10 +273,13 @@ def local(rounds, interval, attackers, base_port, d, dataset="ring", http=False,
 
     def start(nd):
         f = open(os.path.join(d, "logs", nd["name"] + ".log"), "a")   # a restarted node keeps its earlier log
+        ui = ["--ui-port", str(ui_port)] if ui_port and nd["name"] == "agent0" else []
         procs[nd["name"]] = subprocess.Popen([sys.executable, "-m", "mesh.run", "node", "--dir", d, "--name", nd["name"],
-                                              "--rounds", str(rounds)], stdout=f, stderr=subprocess.STDOUT,
+                                              "--rounds", str(rounds), *ui], stdout=f, stderr=subprocess.STDOUT,
                                              cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     print(f"starting {len(nodes)} separate processes (logs in {d}/logs/)")
+    if ui_port:
+        print(f"  playground (agent0's view of the live model): http://127.0.0.1:{ui_port}/")
     for nd in nodes:
         if nd["role"] == "validator":
             start(nd)
@@ -609,6 +632,15 @@ def main():
     a.add_argument("--http", action="store_true", help="talk HTTP instead of raw TCP")
     a.add_argument("--testnet", action="store_true",
                    help="also run a faucet and status page, and have a new agent and validator join mid-run")
+    a.add_argument("--ui-port", type=int, help="serve the playground web page from agent0 on this port")
+    ap_ = sub.add_parser("app", help="the playground web page, on a whole demo network in this one process")
+    ap_.add_argument("--port", type=int, default=8000)
+    ap_.add_argument("--host", default="0.0.0.0")
+    ap_.add_argument("--dataset", choices=["ring", "mnist"], default="mnist")
+    ap_.add_argument("--rounds", type=int, default=150, help="training rounds to run in the background")
+    ap_.add_argument("--no-attackers", action="store_true")
+    ap_.add_argument("--trust-proxy", action="store_true",
+                     help="behind a reverse proxy: rate-limit by the visitor address it forwards")
     b = sub.add_parser("init")
     b.add_argument("--dir", default="net")
     b.add_argument("--host", default="127.0.0.1")
@@ -622,6 +654,8 @@ def main():
     c.add_argument("--name", required=True)
     c.add_argument("--key", default=None, help="private key file (default: DIR/keys/NAME.key)")
     c.add_argument("--rounds", type=int, default=None)
+    c.add_argument("--ui-port", type=int, help="agents: also serve the playground web page on this port")
+    c.add_argument("--trust-proxy", action="store_true", help="the playground is behind a reverse proxy")
     k = sub.add_parser("keygen", help="create a node's private key here and print its public card")
     k.add_argument("--keys", default="keys", help="directory for the private key file")
     k.add_argument("--name", required=True)
@@ -677,10 +711,21 @@ def main():
     j.add_argument("--faucet", help="faucet URL, to get test tokens")
     j.add_argument("--dir", default="mesh-node")
     j.add_argument("--rounds", type=int, default=None)
+    j.add_argument("--ui-port", type=int, help="agents: also serve the playground web page on this port")
+    j.add_argument("--trust-proxy", action="store_true", help="the playground is behind a reverse proxy")
     args = ap.parse_args()
     if args.cmd == "local":
         local(args.rounds, args.interval, not args.no_attackers, args.port, args.dir, args.dataset, http=args.http,
-              testnet=args.testnet)
+              testnet=args.testnet, ui_port=args.ui_port)
+    elif args.cmd == "app":
+        from .app import run_demo
+        _, _, trainer, stop = run_demo(args.port, args.host, args.dataset, args.rounds, not args.no_attackers,
+                                       trust_proxy=args.trust_proxy)
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            stop.set()
     elif args.cmd == "init":
         init(args.dir, host=args.host, base_port=args.port, interval=args.interval, attackers=not args.no_attackers,
              dataset=args.dataset, rounds=args.rounds)
@@ -705,7 +750,8 @@ def main():
             raise SystemExit("servers need --piece, agents need --index")
         from .testnet import join
         join(args.genesis, args.name, args.role, args.endpoint, args.dir, piece=args.piece, index=args.index,
-             faucet=args.faucet, listen=args.listen, rounds=args.rounds)
+             faucet=args.faucet, listen=args.listen, rounds=args.rounds, ui_port=args.ui_port,
+             trust_proxy=args.trust_proxy)
     elif args.cmd == "cluster":
         sys.exit(cluster(args.machine, args.machines, args.my_host, args.coordinator, args.rounds, args.interval,
                          args.dir, attackers=not args.no_attackers, http=args.http, port_base=args.port,
@@ -727,7 +773,8 @@ def main():
                       epoch_blocks=args.epoch_blocks)
         print(f"wrote {args.dir}/genesis.json and {args.dir}/nodes.json from {len(files)} cards")
     else:
-        run_node(args.dir, args.name, args.rounds, key_path=args.key)
+        run_node(args.dir, args.name, args.rounds, key_path=args.key, ui_port=args.ui_port,
+                 trust_proxy=args.trust_proxy)
 
 
 if __name__ == "__main__":

@@ -89,6 +89,17 @@ python -m mesh.run join --genesis https://status.yourdomain/genesis.json --fauce
 test tokens, registers, downloads the current weights and starts taking part. To become a validator, use
 `--role validator`: it joins the set at the next epoch boundary (every 50 blocks), after staking 1,000 test tokens.
 
+## 6. Give the public a page to use the model
+
+Run one agent with the playground on, behind HTTPS (the `play.` site in `deploy/Caddyfile`):
+
+```bash
+python -m mesh.run join ... --role agent --index 0 --ui-port 8000 --trust-proxy
+```
+
+Visitors draw a digit at `https://play.yourdomain` and see the network's answer and which servers computed it.
+Every answer costs that agent a little test-token fee per slice, so keep its balance topped up from the faucet.
+
 ## Rehearse it on one machine first
 
 ```bash

@@ -1,10 +1,19 @@
 # HTTPS for the public web pages, with free certificates that renew themselves (https://caddyserver.com).
-# Replace the two example domains with yours, point their DNS at this server, then: sudo caddy run --config Caddyfile
+# Replace the example domains with yours, point their DNS at this server, then: sudo caddy run --config Caddyfile
 # Nodes talk to each other directly (port 9100); their messages are already encrypted and signed end to end.
 
 status.example.org {
 	reverse_proxy 127.0.0.1:8080
 	header Strict-Transport-Security "max-age=31536000"
+}
+
+play.example.org {
+	# the playground, served by an agent started with --ui-port 8000 --trust-proxy
+	reverse_proxy 127.0.0.1:8000
+	header Strict-Transport-Security "max-age=31536000"
+	request_body {
+		max_size 64KB
+	}
 }
 
 faucet.example.org {

@@ -9,6 +9,11 @@
 **Try it in your browser:** click "Open in GitHub Codespaces" above, wait for it to set up, then type
 `python simulate_mesh.py` in the terminal. Nothing to install; it runs on GitHub's free Codespaces allowance.
 
+**Use the model yourself:** `python -m mesh.run app`, then open http://localhost:8000. Draw a digit and the
+network reads it, showing which servers computed each slice of the answer. See [The playground](#the-playground).
+
+![The Mesh playground: draw a digit, see the answer and the servers it went through](docs/playground.png)
+
 > [!WARNING]
 > **Research prototype.** Mesh is unaudited. Its tokens are play money: don't attach real value to them, and don't
 > train it on sensitive data. See [SECURITY.md](SECURITY.md) and the [threat model](docs/THREAT_MODEL.md).
@@ -28,7 +33,7 @@ Two prototypes in Python (needs `numpy` and `cryptography`: `pip install -r requ
 | **Swarm** (`swarm/`) | Peers learn one model together by gossiping weights. Simple and small. | `python simulate.py` |
 | **Mesh** (`mesh/`) | One model **split across many servers**, trained by agents with private data, coordinated and paid through a **small blockchain**, with defences against cheating. | `python simulate_mesh.py` |
 
-Tests: `python -m unittest discover -s tests` (35 tests, about 30 s). They also run automatically on every pull request.
+Tests: `python -m unittest discover -s tests` (54 tests, about 50 s). They also run automatically on every pull request.
 
 ---
 
@@ -134,6 +139,26 @@ The `local` demo kills a server and a validator halfway, and restarts them three
 In a 24-round run, accuracy reached 94.3%, the restarted validator caught up to the same block height as the
 others, the restarted server resynced and earned rewards again, and no node errors were logged. GitHub runs a
 shorter version of this, over TCP and HTTP, on every pull request.
+
+### The playground
+
+A web page where anyone can use the shared model: draw a digit (0 to 9) and see what the network thinks, how sure
+it is, and the route your request took (which server ran each slice, how long it took, and whether that answer was
+double-checked by other replicas). It also shows training progress live and which nodes were ejected for cheating.
+
+```bash
+python -m mesh.run app                       # demo: a whole network in one process, training as you watch
+python -m mesh.run app --dataset ring        # the quick 2-D task: click points instead of drawing
+python -m mesh.run local --dataset mnist --ui-port 8000      # a real multi-process network, page served by agent0
+python -m mesh.run node --name agent0 --ui-port 8000 ...     # any agent on a real network can serve the page
+```
+
+The page is safe to put on the open web: no third-party code, a strict content security policy, request size
+limits, a per-visitor rate limit (use `--trust-proxy` behind Caddy or nginx), and a cap on answers in progress.
+Visitors' drawings are only used to answer them; the model never learns from them.
+
+What the model is, plainly: a small neural network that recognises handwritten digits (trained on MNIST) or, in
+the quick task, sorts points into 4 classes. It is not a chatbot and it does not read websites.
 
 ### A public test network
 
