@@ -19,7 +19,7 @@ You need Python 3.10 or newer.
 ```bash
 git clone https://github.com/Davy765/mesh- && cd mesh-
 pip install -r requirements.txt            # numpy and cryptography
-python -m unittest discover -s tests       # about 15 seconds; everything should pass
+python -m unittest discover -s tests       # about 25 seconds; everything should pass
 python simulate_mesh.py                    # the whole system with attackers, about 25 seconds
 ```
 

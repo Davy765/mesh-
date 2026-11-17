@@ -17,7 +17,7 @@ Two prototypes in Python (needs `numpy` and `cryptography`: `pip install -r requ
 | **Swarm** (`swarm/`) | Peers learn one model together by gossiping weights. Simple and small. | `python simulate.py` |
 | **Mesh** (`mesh/`) | One model **split across many servers**, trained by agents with private data, coordinated and paid through a **small blockchain**, with defences against cheating. | `python simulate_mesh.py` |
 
-Tests: `python -m unittest discover -s tests` (19 tests, about 15 s). They also run automatically on every pull request.
+Tests: `python -m unittest discover -s tests` (32 tests, about 25 s). They also run automatically on every pull request.
 
 ---
 
@@ -64,11 +64,15 @@ Tests: `python -m unittest discover -s tests` (19 tests, about 15 s). They also 
 | Problem | What Mesh does | Status |
 | --- | --- | --- |
 | Shared password = everyone trusted (Swarm) | Each participant has its own Ed25519 identity, registered on chain with a stake. Unregistered senders are refused. | **Fixed** |
-| Messages in plain JSON over HTTP (Swarm) | Binary arrays (no pickle), AES-256-GCM encryption per pair of peers, signatures, and replay protection. An eavesdropper on every link captured 600 MB and could read none of the payloads. | **Fixed** in the simulated network (real sockets not built) |
+| Messages in plain JSON over HTTP (Swarm) | Binary arrays (no pickle), AES-256-GCM encryption per pair of peers, signatures, and replay protection, over raw TCP or HTTP(S). An eavesdropper on every link captured 600 MB and could read none of the payloads. | **Fixed** |
 | Everyone must agree on the model (Swarm) | The genesis block fixes the architecture, seed and hash of every piece. A node whose starting weights don't match refuses to start. | **Fixed** |
 | One machine can't hold a big model | It's split into slices with 3 replicas each. If a server crashes, requests fail over to another replica. | **Fixed** (at toy scale) |
-| Can't tell if a server did the work correctly | Every answer carries a signed receipt. Every training step goes to all replicas and is compared, and 15% of inference hops are re-run on another replica. When 2 replicas agree against a third, the receipts prove it and the chain slashes the liar. In the demo, the lying server was caught at block 3 and agents then routed around it. | **Training: fixed. Inference: mitigated** (sampled, so high probability, not certainty). Needs an honest majority per slice and math that gives identical results on every machine. |
-| Poisoned training updates from **servers** | Slice updates are recomputed by every replica from the same declared inputs, and the majority's result wins. The poisoning server was outvoted in **every round**: 100/100 on the toy task, 150/150 on MNIST and 42/42 on the real network. | **Fixed**, given an honest majority of each slice's replicas and identical math on each machine |
+| Can't tell if a server did the work correctly | Every answer carries a signed receipt. Every training step goes to all replicas and is compared, and 15% of inference hops are re-run on another replica. When 2 replicas agree against a third, the receipts prove it and the chain slashes the liar. In the demo, the lying server was caught at block 3 and agents then routed around it. | **Training: fixed. Inference: mitigated** (sampled, so high probability, not certainty). Needs an honest majority per slice. |
+| Poisoned training updates from **servers** | Slice updates are recomputed by every replica from the same declared inputs, and the majority's result wins. The poisoning server was outvoted in **every round**: 100/100 on the toy task, 150/150 on MNIST and 42/42 on the real network. | **Fixed**, given an honest majority of each slice's replicas |
+| Different hardware computing slightly different results | Weight updates are snapped to a fixed 2^-24 grid before they are applied and hashed, and spot checks compare results rounded to 4 decimals, so last-bit differences between honest machines almost never change a hash. A test makes one replica per slice compute with a 1e-12 error: without rounding it is outvoted, with rounding everyone agrees and nobody is slashed. | **Mitigated**: tested against simulated differences, not yet on two physically different machines. A rare round that still splits just fails and the next one retries. |
+| Withholding: sending inputs or salts to only some replicas | Two colluding agents could stall training completely this way (a test reproduces it). Replicas now fetch anything they were left out of from other replicas, and the on-chain fingerprint proves it is genuine. | **Fixed** (tested) |
+| A node restarts | Validators save every block to disk, replay it on restart (re-checking signatures and results), then fetch what they missed. Servers and agents rejoin and download the agreed weights, hash-checked. The multi-process demo kills and restarts a validator and a server and checks both catch up. | **Fixed** |
+| One file held every node's private key | Each node now makes its own key file on its own machine (`mesh.run keygen`); the network config is built from public cards only. | **Fixed** |
 | Poisoned training updates from **agents** | Their updates come from private data, so they're trust-weighted against a public seed set. Updates that point the wrong way get zero weight. The cheating agent was excluded in 91–150 of the rounds, depending on the run. Honest agents with unusual data are sometimes down-weighted too. | **Mitigated**: it needs a small public labelled set. A saboteur can't damage what others teach, but if it is the *only* holder of some data (digits 4 and 9 in the MNIST demo), nobody else can teach the model that. |
 | Speed of an internet-wide pipeline | Inference routes to the fastest trustworthy replica: **249 ms per hop** against 284 ms random, with 244 ms the best possible. Micro-batches pipeline through the slices: one job chunk took **1.8 s instead of 3.1 s**. | **Mitigated**: an internet pipeline is still much slower than one datacenter. That part is physics. |
 | Incentives can be gamed | Joining needs a stake, which makes fake identities costly. Pay is per signed receipt, settled once per round. Training rewards go only to updates that were kept, in proportion to paid work. Cheaters are slashed and the reporter gets a bounty. | **Mitigated**: the prices and penalties are untested against real, motivated attackers. |
@@ -83,8 +87,8 @@ Tests: `python -m unittest discover -s tests` (19 tests, about 15 s). They also 
 | Everyone honest (`--no-attackers`) | 93.4% |
 | Lying server, poisoning server, cheating agent, forging validator and a crash, all at once | 94.2% |
 | `--activation-noise 0.5` | 93.5% (but only 75% when the noise is also applied at inference) |
-| `--privacy 0.3` (ε ≈ 2,560) | 88.8% |
-| `--privacy 1.0` (ε ≈ 298) | 33.6%: unstable. It reached 74% at round 80, then collapsed. The 25% vote check lets very noisy steps through. |
+| `--privacy 0.3` (ε ≈ 2,560) | 88.8% (measured before the strict vote; likely higher now) |
+| `--privacy 1.0` (ε ≈ 298) | 83–95% over 4 runs (the noise differs every run). It used to collapse to 34%: the 25% vote let very noisy steps through, so with privacy noise on the vote is now strict (any step that makes things worse is rejected). |
 
 Each agent alone (only 2 of the 4 classes) gets about 49%. Smaller ε means stronger privacy; useful values are under 10.
 Getting there without losing accuracy takes thousands of participants, not 5.
@@ -92,66 +96,43 @@ Getting there without losing accuracy takes thousands of participants, not 5.
 ### Running it as real, separate programs
 
 ```bash
-python -m mesh.run local --rounds 40        # 21 OS processes on this machine, talking over TCP
-python -m mesh.run init --dir net --host <ip>   # or: write a config, copy it to several machines,
-python -m mesh.run node --dir net --name agent2 #     and start each node where you like
+python -m mesh.run local --rounds 40          # 21 OS processes on this machine, over raw TCP
+python -m mesh.run local --rounds 40 --http   # the same over HTTP
+```
+
+Across several machines, private keys never leave the machine that owns them:
+
+```bash
+# on each machine, once per node it will run (prints a public card; the key stays in keys/):
+python -m mesh.run keygen --name agent2 --role agent --index 2 --endpoint 203.0.113.5:9100 > agent2.card.json
+# behind HTTPS, give the public URL as the endpoint and the local address to bind with --listen
+# collect the cards (public keys only) anywhere and build the network config:
+python -m mesh.run genesis --dir net --cards *.card.json --rounds 40
+# copy net/genesis.json and net/nodes.json to every machine, then on each:
+python -m mesh.run node --dir net --name agent2 --key keys/agent2.key
 ```
 
 Each validator, server and agent is its own process listening on its own port. Validators take turns proposing
 in fixed time slots, and a dead or forging proposer just loses its slot. Servers and agents read the chain like a
 light client: they trust a state hash only if enough validators report it, then check the downloaded state
-against that hash.
+against that hash. Validators save every block to `net/data/` and replay it after a restart; restarted servers
+and agents download the agreed weights. The live ledger state keeps the last 500 rounds; the blocks keep
+everything.
 
-In a test run (40 rounds, 7 validators, about 5 minutes), test accuracy reached 89.7%:
-- one server and one honest validator were killed with SIGKILL halfway through, and the network kept going
-- the forging validator had all 24 of its blocks refused
-- a hop took 3.2 ms over local sockets
-- no node errors were logged
-
-**Demo shortcut:** `init` writes every node's key seed into `nodes.json`. In real use, each machine should make its
-own key and share only the public part.
-
-### A bigger model: real handwritten digits (MNIST)
-
-```bash
-python simulate_mesh.py --dataset mnist                          # about 8 minutes
-python -m mesh.run local --dataset mnist --rounds 30 --interval 4  # 21 real processes
-```
-
-Uses 70,000 real 28x28 digit images, downloaded once and checked against their published checksums. The model has
-**1,982,986 parameters**: the agents' ends are 407,050, and each of the 3 slices is 525,312, held by 3 servers.
-Each agent sees only 2 of the 10 digits.
-
-Accuracy on the 10,000 test digits after 150 rounds:
-
-| Run | Accuracy |
-| --- | --- |
-| Same model on one machine, no Mesh, fixed step size | 88.6% at the end (it touched 95.1% at one checkpoint) |
-| Same, with the step size shrinking over the run | 91.2% |
-| Mesh, everyone honest (average of the last 3 checkpoints, 3 seeds) | 88.9% (87.8% with a fixed step size) |
-| Mesh, with all the attackers (1 run) | 82.1%: digits 0–3 and 5–8 at 89–99%; 4 and 9 (only the cheater has them) at 42% and 27% |
-
-What this shows:
-- **Size cost:** about 3.4 s of computer time and 280 MB of encrypted traffic per round. Over real sockets, with
-  21 processes on a 4-core machine, a hop takes about 264 ms (3 ms with the toy model).
-- **Earlier version:** 86.0% honest and 71.3% with attackers. There, the outlier check never caught the
-  poisoning server in 2 million dimensions, and a vote that rejected any loss increase threw away half the rounds.
-  Verified slice training, trust weighting and the relative 25% vote fixed both.
-- **Single digits swing, even without Mesh.** With a fixed step size, one digit often lost more than 20 points
-  in a single round; on one machine with no network and no attackers this happened 110 times after round 50.
-  Each agent's gradient is clipped to a fixed size for privacy, and the output layer's gradients stay above that
-  limit, so every step is the same size and that layer never settles. An earlier report that digit 8 had dropped
-  to 37% was a snapshot taken during one of these dips: a rerun with the same settings ended with digit 8 at 96%.
-  The step size now shrinks over the planned run (`lr_decay_rounds`, fixed at genesis so every node agrees). On
-  one machine that cut the big dips from 110 to 21; in Mesh it cut them by about a third and raised the weakest
-  digit from 70% to 77% on average.
-- **What attackers still cost:** mostly the digits only the cheater holds.
+The `local` demo kills a server and a validator halfway, and restarts them three-quarters of the way through.
+In a 24-round run, accuracy reached 94.3%, the restarted validator caught up to the same block height as the
+others, the restarted server resynced and earned rewards again, and no node errors were logged. GitHub runs a
+shorter version of this, over TCP and HTTP, on every pull request.
 
 ### Not built yet
 
-Validators joining or
-leaving (the set is fixed at genesis) and full BFT consensus, defences against a majority of one
-slice's replicas colluding or against withholding reveals from some peers, and large models.
+- **Validators joining or leaving** (the set is fixed at genesis) and a full BFT protocol instead of
+  time-slot leader rotation.
+- **A colluding majority of one slice's replicas.** With 3 replicas, 2 colluding servers can poison that slice
+  undetected. More replicas per slice raise the bar but cost more computing.
+- **Hiding who talks to whom.** Traffic is encrypted, but its size and pattern are visible.
+- **Large models and GPUs.** The biggest tested model has 2 million parameters, in plain NumPy.
+- **Running across physically separate machines.** Supported (keygen, HTTPS), but not yet done.
 
 ### Code map
 
@@ -166,7 +147,7 @@ slice's replicas colluding or against withholding reveals from some peers, and l
 | `mesh/agent.py` | Agent: routing, failover, spot checks, training, voting, job market |
 | `mesh/sim.py` | Builds a whole network in one process, with optional attackers; the public seed set |
 | `mesh/datasets.py` | MNIST download (checksum-verified) and the per-class split |
-| `mesh/transport.py`, `mesh/chain_net.py`, `mesh/run.py` | Real TCP networking, networked validators and light client, one-process-per-node runner |
+| `mesh/transport.py`, `mesh/chain_net.py`, `mesh/run.py` | Real networking (TCP or HTTP), networked validators with saved blocks and a light client, key generation, one-process-per-node runner |
 
 ---
 
