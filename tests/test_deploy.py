@@ -14,7 +14,7 @@ class Keys(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             run.init(d, n_agents=2, replicas=2, n_validators=4)
             secrets = [json.load(open(os.path.join(d, "keys", f)))["secret"] for f in os.listdir(os.path.join(d, "keys"))]
-            self.assertEqual(len(secrets), 4 + 3 * 2 + 2)
+            self.assertEqual(len(secrets), 4 + 3 * 2 + 2 + 1)                   # + the faucet account
             shared = open(os.path.join(d, "genesis.json")).read() + open(os.path.join(d, "nodes.json")).read()
             nodes = json.load(open(os.path.join(d, "nodes.json")))
             self.assertTrue(all("seed" not in n and "secret" not in n for n in nodes))
@@ -197,3 +197,21 @@ class ValidatorSet(unittest.TestCase):
         self.assertEqual(st.apply(too_much), "insufficient balance")
         forged = make_tx(alice, "transfer", {"to": alice.address, "amount": 1, "sign_pk": faucet.sign_pk}, 0)
         self.assertEqual(st.apply(forged), "bad signature")
+
+
+class StatusPage(unittest.TestCase):
+    def test_renders_and_escapes_node_names(self):
+        from mesh.sim import World
+        from mesh.testnet import render_status, status_summary
+        w = World(adversaries=True)
+        for _ in range(3):
+            w.round()
+        w.agents[0].name = "<script>alert(1)</script>"            # a hostile node name
+        st = w.chain.state
+        for v in w.chain.validators:
+            v.state.nodes[w.agents[0].address]["name"] = w.agents[0].name
+        page = render_status(status_summary(w.chain), 4, 2, "http://x/genesis.json")
+        self.assertIn("Mesh test network", page)
+        self.assertIn(f"<b>{st.round}</b>", page)
+        self.assertNotIn("<script>", page)
+        self.assertIn("&lt;script&gt;", page)

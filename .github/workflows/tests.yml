@@ -77,3 +77,35 @@ jobs:
           grep -q "honest servers outvoted: none" m0.out
           grep -Eq "training rounds: [0-9]+, accepted [1-9]" m0.out
 
+  docker:
+    # The image a test network's servers run (see deploy/TESTNET.md): it must build and run commands.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t mesh .
+      - name: Run commands inside the image
+        run: |
+          docker run --rm mesh keygen --keys /tmp/k --name v0 --role validator --endpoint 1.2.3.4:9100 | grep -q '"sign_pk"'
+          docker run --rm mesh --help | grep -q join
+
+  testnet-rehearsal:
+    # The public test network on one runner: faucet, status page, and a new agent and validator joining mid-run.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Rehearse
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+        run: |
+          timeout 600 python -m mesh.run local --testnet --rounds 20 --interval 1.5 --dir net-tn | tee out.txt
+          grep -q "newcomer-agent: registered, active" out.txt
+          grep -q "newcomer-validator: in the validator set" out.txt
+          grep -q "node errors logged: 0" out.txt
+          ! grep -h '"error"' net-tn/logs/newcomer*.log
+

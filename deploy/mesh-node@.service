@@ -1,0 +1,22 @@
+# systemd unit: one Mesh node per instance, restarted automatically if it crashes or the server reboots.
+#   sudo cp deploy/mesh-node@.service /etc/systemd/system/
+#   sudo systemctl enable --now mesh-node@validator0
+# Expects the code in /opt/mesh, the network config in /var/lib/mesh/net, and the key in /var/lib/mesh/net/keys.
+[Unit]
+Description=Mesh node %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=mesh
+WorkingDirectory=/opt/mesh
+Environment=OPENBLAS_NUM_THREADS=1
+ExecStart=/usr/bin/python3 -m mesh.run node --dir /var/lib/mesh/net --name %i
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mesh
+
+[Install]
+WantedBy=multi-user.target

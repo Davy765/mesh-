@@ -61,19 +61,24 @@ def keygen(keys_dir, name, role, endpoint, piece=None, index=None, behaviour="ho
     return card
 
 
-def build_genesis(d, cards, interval=2.0, seed=0, dataset="ring", rounds=None):
+def build_genesis(d, cards, interval=2.0, seed=0, dataset="ring", rounds=None, faucet_address=None,
+                  epoch_blocks=50):
     """Write genesis.json and nodes.json from public cards only: no private material ever goes in."""
     from .sim import load_task
     os.makedirs(d, exist_ok=True)
     cards = [{k: c[k] for k in PUBLIC_CARD_FIELDS if k in c} for c in cards]
-    n_agents = sum(c["role"] == "agent" for c in cards)
+    # Demo data is split into at least 5 shards, so agents who join a running network later have data to use.
+    n_agents = max(sum(c["role"] == "agent" for c in cards), 5)
     spec, *_, lr = load_task(dataset, n_agents, seed)
     genesis = {
         "spec": spec.to_obj(),
         "piece_hashes": {p: param_hash(init_piece(spec, p)) for p in spec.pieces},
-        "balances": {c["address"]: (20000 if c["role"] == "agent" else 400) for c in cards if c["role"] != "validator"},
+        "balances": {**{c["address"]: (20000 if c["role"] == "agent" else 400) for c in cards
+                        if c["role"] != "validator"},
+                     **({faucet_address: 10 ** 7} if faucet_address else {})},   # test tokens to hand out
         "params": {"min_stake": 100, "price": 1, "slash_fraction": 0.5, "whistleblower_share": 0.2,
-                   "emission": 30, "accept_tol": 0.25, "lr_decay_rounds": rounds},
+                   "emission": 30, "accept_tol": 0.25, "lr_decay_rounds": rounds,
+                   "validator_min_stake": 1000, "epoch_blocks": epoch_blocks},
         "validators": [{k: c[k] for k in ("address", "sign_pk", "kex_pk", "endpoint")}
                        for c in cards if c["role"] == "validator"],
         "interval": interval, "n_agents": n_agents, "data_seed": seed, "dataset": dataset, "lr": lr,
@@ -98,7 +103,7 @@ def demo_layout(n_agents=5, replicas=3, n_validators=7, attackers=True, n_slices
 
 
 def init(d, n_agents=5, replicas=3, n_validators=7, host="127.0.0.1", base_port=9100, attackers=True,
-         interval=2.0, seed=0, dataset="ring", rounds=None, http=False):
+         interval=2.0, seed=0, dataset="ring", rounds=None, http=False, epoch_blocks=50):
     """Demo shortcut: generate every node's key on this machine (in d/keys/) and build genesis.
     For a real deployment, run `keygen` on each machine instead and collect only the cards."""
     cards = []
@@ -107,7 +112,10 @@ def init(d, n_agents=5, replicas=3, n_validators=7, host="127.0.0.1", base_port=
         cards.append(keygen(os.path.join(d, "keys"), nd["name"], nd["role"], f"http://{addr}" if http else addr,
                             piece=nd.get("piece"), index=nd.get("index"), behaviour=nd["behaviour"],
                             listen=addr if http else None))
-    return build_genesis(d, cards, interval=interval, seed=seed, dataset=dataset, rounds=rounds)
+    faucet = Identity.generate()
+    faucet.save(os.path.join(d, "keys", "faucet.key"))
+    return build_genesis(d, cards, interval=interval, seed=seed, dataset=dataset, rounds=rounds,
+                         faucet_address=faucet.address, epoch_blocks=epoch_blocks)
 
 
 def load(d):
@@ -121,14 +129,29 @@ def run_node(d, name, rounds=None, key_path=None):
     ident = Identity.load(key_path or os.path.join(d, "keys", f"{name}.key"))
     if ident.sign_pk != nd["sign_pk"]:
         raise SystemExit(f"{name}: this key file does not match the public key in nodes.json")
+    run_member(d, genesis, nd, ident, rounds)
+
+
+def run_member(d, genesis, nd, ident, rounds=None):
+    """Run one node from its card. Works for nodes listed at genesis and for nodes that join later."""
+    name = nd["name"]
     http_mode = is_http(nd["endpoint"])
     host, port = parse_endpoint(nd.get("listen") or (
         f"0.0.0.0:{urllib.parse.urlsplit(nd['endpoint']).port or 80}" if http_mode else nd["endpoint"]))
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
     if nd["role"] == "validator":
-        v = ValidatorNode(ident, genesis, genesis["interval"], corrupt=nd["behaviour"] == "corrupt")
+        v = ValidatorNode(ident, genesis, genesis["interval"], corrupt=nd.get("behaviour") == "corrupt")
         replayed = v.persist_to(os.path.join(d, "data", name, "blocks.jsonl"))
+        if not any(x["address"] == ident.address for x in genesis["validators"]):
+            chain = RemoteChain(genesis)                # joining later: ask to be added at the next epoch
+            st = chain.state
+            if not any(x["address"] == ident.address for x in st.validators + st.pending_validators["join"]):
+                from .chain import make_tx
+                chain.submit(make_tx(ident, "validator_join", {
+                    "stake": int(genesis["params"].get("validator_min_stake", 1000)), "sign_pk": ident.sign_pk,
+                    "kex_pk": ident.kex_pk, "endpoint": nd["endpoint"]}, st.nonces.get(ident.address, 0)))
+                log(name, event="validator_join_requested", next_epoch=st._next_epoch())
         log(name, event="started", endpoint=nd["endpoint"], replayed_blocks=replayed)
         threading.Thread(target=lambda: _report_validator(v, name, stop), daemon=True).start()
         v.run(host, port, stop, http_mode=http_mode)
@@ -140,14 +163,15 @@ def run_node(d, name, rounds=None, key_path=None):
 
     spec = Spec(**genesis["spec"])
     chain = RemoteChain(genesis)
-    common = dict(lr=genesis.get("lr", 0.5), clip_norm=CLIP, dp_sigma=0.0, behaviour=nd["behaviour"], seed=abs(hash(name)) % 2 ** 31)
+    common = dict(lr=genesis.get("lr", 0.5), clip_norm=CLIP, dp_sigma=0.0, behaviour=nd.get("behaviour", "honest"),
+                  seed=abs(hash(name)) % 2 ** 31)
     if nd["role"] == "server":
         m = SliceServer(ident, name, nd["piece"], spec, chain, **common)
     else:
         _, Xall, yall, Xtest, ytest, shards, _ = load_task(genesis.get("dataset", "ring"), genesis["n_agents"],
                                                            genesis["data_seed"])
         Xtest, ytest = Xtest[:2000], ytest[:2000]
-        Xs, ys = shards[nd["index"]]
+        Xs, ys = shards[nd["index"] % len(shards)]
         perm = np.random.default_rng(nd["index"]).permutation(len(Xs))
         m = Agent(ident, name, spec, chain, Xs[perm], ys[perm], seed_set=public_seed_set(Xall, yall), **common)
     TCPNetwork(chain.directory).attach(m)
@@ -156,6 +180,12 @@ def run_node(d, name, rounds=None, key_path=None):
         log(name, event="rejoining", round=chain.state.round, resynced=m.rejoin())
     else:
         m.register("server" if nd["role"] == "server" else "client", 200, endpoint=nd["endpoint"])
+        t0 = time.time()
+        while not m.active and time.time() - t0 < 60:     # wait for the registration to be in a block
+            time.sleep(0.5)
+            chain.refresh()
+        if chain.state.round > 0:                          # joining a network that has already trained:
+            log(name, event="joining", round=chain.state.round, resynced=m.rejoin())   # get today's weights
     log(name, event="started", endpoint=nd["endpoint"], address=m.address)
 
     I = genesis["interval"]
@@ -173,6 +203,8 @@ def run_node(d, name, rounds=None, key_path=None):
                     m.phase_finalize()
                     if rounds and st.round >= rounds + 3:
                         break
+                else:                                  # first round I take part in: make sure my weights
+                    m.rejoin()                         # are this round's (the network may have moved on)
                 joined = True
                 if nd["role"] == "agent":
                     time.sleep(0.15 * I)          # let servers switch to this round's weights first
@@ -206,7 +238,7 @@ def _report_validator(v, name, stop):
 
 
 # ---------------------------------------------------------------- everything locally
-def local(rounds, interval, attackers, base_port, d, dataset="ring", http=False):
+def local(rounds, interval, attackers, base_port, d, dataset="ring", http=False, testnet=False):
     marker = os.path.join(d, ".mesh-local")
     if os.path.exists(d) and os.listdir(d) and not os.path.exists(marker):
         raise SystemExit(f"{d} exists and was not made by `local`; pick another --dir")
@@ -214,7 +246,7 @@ def local(rounds, interval, attackers, base_port, d, dataset="ring", http=False)
     os.makedirs(d)
     open(marker, "w").close()
     genesis, nodes = init(d, interval=interval, attackers=attackers, base_port=base_port, dataset=dataset,
-                          rounds=rounds, http=http)
+                          rounds=rounds, http=http, epoch_blocks=15 if testnet else 50)
     os.makedirs(os.path.join(d, "logs"), exist_ok=True)
     procs = {}
 
@@ -231,6 +263,19 @@ def local(rounds, interval, attackers, base_port, d, dataset="ring", http=False)
     for nd in nodes:
         if nd["role"] != "validator":
             start(nd)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    extra = {}
+
+    def spawn(name, args):
+        f = open(os.path.join(d, "logs", name + ".log"), "a")
+        extra[name] = subprocess.Popen([sys.executable, "-m", "mesh.run", *args], stdout=f, stderr=subprocess.STDOUT,
+                                       cwd=root)
+    if testnet:                                   # the services a public test network runs
+        spawn("faucet", ["faucet", "--genesis", os.path.join(d, "genesis.json"),
+                         "--key", os.path.join(d, "keys", "faucet.key"), "--port", str(base_port + 60)])
+        spawn("status", ["status", "--genesis", os.path.join(d, "genesis.json"), "--port", str(base_port + 61)])
+        print(f"  status page: http://127.0.0.1:{base_port + 61}/   faucet: http://127.0.0.1:{base_port + 60}/")
+    joined = False
     chain = RemoteChain(genesis)
     t0 = time.time()
     killed = restarted = False
@@ -251,6 +296,17 @@ def local(rounds, interval, attackers, base_port, d, dataset="ring", http=False)
                         start(nd)                         # same key, same saved blocks: it must catch up
                 print(f"  ++ round {st.round}: restarted {' and '.join(victims)}")
                 restarted = True
+            if testnet and not joined and st.round >= 2:
+                for name, role, more in (("newcomer-agent", "agent", ["--index", "1"]),
+                                         ("newcomer-validator", "validator", [])):
+                    port = base_port + (62 if role == "agent" else 63)
+                    ep = f"127.0.0.1:{port}"
+                    spawn(name, ["join", "--genesis", f"http://127.0.0.1:{base_port + 61}/genesis.json",
+                                 "--faucet", f"http://127.0.0.1:{base_port + 60}", "--name", name, "--role", role,
+                                 "--endpoint", f"http://{ep}" if http else ep, "--listen", ep,
+                                 "--dir", os.path.join(d, "joiners", name), "--rounds", str(rounds), *more])
+                print(f"  ++ round {st.round}: a new agent and a new validator are joining from scratch")
+                joined = True
             evals = _read(d, "agent0", "eval")
             if evals and evals[-1]["round"] != last_print:
                 last_print = evals[-1]["round"]
@@ -264,11 +320,16 @@ def local(rounds, interval, attackers, base_port, d, dataset="ring", http=False)
             _ledger_summary(chain)
         except Exception as e:                          # never let reporting stop the shutdown
             print(f"  (could not read the ledger: {e})")
-        for p in procs.values():
+        if testnet:
+            try:
+                _testnet_summary(chain, d, base_port)
+            except Exception as e:                      # reporting must never stop the shutdown
+                print(f"  (could not summarise the test network: {e})")
+        for p in list(procs.values()) + list(extra.values()):
             if p.poll() is None:
                 p.send_signal(signal.SIGTERM)
         time.sleep(1)
-        for p in procs.values():
+        for p in list(procs.values()) + list(extra.values()):
             if p.poll() is None:
                 p.kill()
     _summary(d, genesis, nodes)
@@ -457,6 +518,22 @@ def _cross_machine_summary(chain, nodes):
              " (all honest replicas had the same CPU model, so this says nothing about mixed hardware)"))
 
 
+def _testnet_summary(chain, d, base_port):
+    chain.refresh()
+    st = chain.state
+    print("\n== Test network ==")
+    agent = next((n for n in st.nodes.values() if n.get("name") == "newcomer-agent"), None)
+    print(f"  newcomer-agent: {'registered, ' + ('active' if agent['active'] else 'ejected') if agent else 'NOT registered'}"
+          + (f", reputation {agent['rep']}" if agent else ""))
+    asked = bool(_read(d, "newcomer-validator", "validator_join_requested"))
+    in_set = any(v["endpoint"].rstrip("/").endswith(f":{base_port + 63}") for v in st.validators)
+    print(f"  newcomer-validator: asked to join: {'yes' if asked else 'no'}")
+    print(f"  newcomer-validator: {'in the validator set' if in_set else 'not in the set (yet)'}; "
+          f"set size {len(st.validators)}, quorum {st.validator_set()[1]}")
+    status = os.path.join(d, "logs", "status.log")
+    print(f"  faucet and status page logs: {os.path.join(d, 'logs')}/faucet.log, {status}")
+
+
 def _restart_summary(d):
     for name in ("validator3", "server0.1"):
         starts = _read(d, name, "started") + _read(d, name, "rejoining")
@@ -529,6 +606,8 @@ def main():
     a.add_argument("--dir", default="net-local")
     a.add_argument("--dataset", choices=["ring", "mnist"], default="ring")
     a.add_argument("--http", action="store_true", help="talk HTTP instead of raw TCP")
+    a.add_argument("--testnet", action="store_true",
+                   help="also run a faucet and status page, and have a new agent and validator join mid-run")
     b = sub.add_parser("init")
     b.add_argument("--dir", default="net")
     b.add_argument("--host", default="127.0.0.1")
@@ -556,6 +635,8 @@ def main():
     g.add_argument("--interval", type=float, default=2.0)
     g.add_argument("--dataset", choices=["ring", "mnist"], default="ring")
     g.add_argument("--rounds", type=int, default=None)
+    g.add_argument("--faucet-address", help="test-network faucet account to fund with play money")
+    g.add_argument("--epoch-blocks", type=int, default=50, help="how often validator set changes take effect")
     m = sub.add_parser("cluster", help="run this machine's share of a multi-machine network")
     m.add_argument("--machine", type=int, required=True)
     m.add_argument("--machines", type=int, required=True)
@@ -569,13 +650,57 @@ def main():
     m.add_argument("--http", action="store_true")
     m.add_argument("--no-attackers", action="store_true")
     m.add_argument("--dataset", choices=["ring", "mnist"], default="ring")
+    fa = sub.add_parser("faucet", help="hand out test tokens")
+    fa.add_argument("--genesis", required=True)
+    fa.add_argument("--key", required=True, help="the faucet account's key file")
+    fa.add_argument("--port", type=int, default=8090)
+    fa.add_argument("--amount", type=int, default=1500)
+    st_ = sub.add_parser("status", help="serve a live status page (and genesis.json for joiners)")
+    st_.add_argument("--genesis", required=True)
+    st_.add_argument("--port", type=int, default=8080)
+    st_.add_argument("--public-url", help="the genesis.json URL to show joiners")
+    lv = sub.add_parser("leave", help="ask for a validator to leave the set at the next epoch")
+    lv.add_argument("--genesis", required=True)
+    lv.add_argument("--key", required=True, help="the validator's key file")
+    j = sub.add_parser("join", help="join a running network as a new node")
+    j.add_argument("--genesis", required=True, help="path or URL of the network's genesis.json")
+    j.add_argument("--name", required=True)
+    j.add_argument("--role", required=True, choices=["agent", "server", "validator"])
+    j.add_argument("--endpoint", required=True, help="host:port (or URL) other nodes reach you at")
+    j.add_argument("--listen", help="host:port to bind, if different from the endpoint")
+    j.add_argument("--piece", help="servers: which slice")
+    j.add_argument("--index", type=int, help="agents: which demo data shard")
+    j.add_argument("--faucet", help="faucet URL, to get test tokens")
+    j.add_argument("--dir", default="mesh-node")
+    j.add_argument("--rounds", type=int, default=None)
     args = ap.parse_args()
     if args.cmd == "local":
-        local(args.rounds, args.interval, not args.no_attackers, args.port, args.dir, args.dataset, http=args.http)
+        local(args.rounds, args.interval, not args.no_attackers, args.port, args.dir, args.dataset, http=args.http,
+              testnet=args.testnet)
     elif args.cmd == "init":
         init(args.dir, host=args.host, base_port=args.port, interval=args.interval, attackers=not args.no_attackers,
              dataset=args.dataset, rounds=args.rounds)
         print(f"wrote {args.dir}/genesis.json and {args.dir}/nodes.json")
+    elif args.cmd == "faucet":
+        from .testnet import fetch_genesis, serve_faucet
+        serve_faucet(fetch_genesis(args.genesis), args.key, args.port, args.amount).serve_forever()
+    elif args.cmd == "status":
+        from .testnet import fetch_genesis, serve_status
+        serve_status(fetch_genesis(args.genesis), args.port, public_url=args.public_url).serve_forever()
+    elif args.cmd == "leave":
+        from .chain import make_tx
+        from .testnet import fetch_genesis
+        chain = RemoteChain(fetch_genesis(args.genesis))
+        ident = Identity.load(args.key)
+        st = chain.state
+        chain.submit(make_tx(ident, "validator_leave", {}, st.nonces.get(ident.address, 0)))
+        print(f"asked for {ident.address} to leave at block {st._next_epoch()} (the set never drops below 4)")
+    elif args.cmd == "join":
+        if args.role == "server" and not args.piece or args.role == "agent" and args.index is None:
+            raise SystemExit("servers need --piece, agents need --index")
+        from .testnet import join
+        join(args.genesis, args.name, args.role, args.endpoint, args.dir, piece=args.piece, index=args.index,
+             faucet=args.faucet, listen=args.listen, rounds=args.rounds)
     elif args.cmd == "cluster":
         sys.exit(cluster(args.machine, args.machines, args.my_host, args.coordinator, args.rounds, args.interval,
                          args.dir, attackers=not args.no_attackers, http=args.http, port_base=args.port,
@@ -593,7 +718,8 @@ def main():
     elif args.cmd == "genesis":
         files = [f for pattern in args.cards for f in glob.glob(pattern)]
         build_genesis(args.dir, [json.load(open(f)) for f in files], interval=args.interval,
-                      dataset=args.dataset, rounds=args.rounds)
+                      dataset=args.dataset, rounds=args.rounds, faucet_address=args.faucet_address,
+                      epoch_blocks=args.epoch_blocks)
         print(f"wrote {args.dir}/genesis.json and {args.dir}/nodes.json from {len(files)} cards")
     else:
         run_node(args.dir, args.name, args.rounds, key_path=args.key)

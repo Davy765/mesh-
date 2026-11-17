@@ -1,0 +1,8 @@
+.git
+.github
+net*
+mesh-node
+__pycache__
+*.key
+docs
+tests
