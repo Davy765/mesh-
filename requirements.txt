@@ -1,2 +1,2 @@
 numpy>=1.24,<3
-cryptography>=44,<51
+cryptography>=50.0.2,<51
