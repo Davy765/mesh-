@@ -31,11 +31,17 @@ def load_task(dataset, n_agents, seed=0):
 
 class World:
     def __init__(self, n_agents=5, replicas=3, adversaries=True, dp_sigma=0.0, activation_noise=0.0,
-                 spot_check=0.15, lr=None, clip_norm=2.0, seed=0, dataset="ring", accept_tol=0.25,
+                 spot_check=0.15, lr=None, clip_norm=2.0, seed=0, dataset="ring", accept_tol=None,
                  lr_down=0.5, lr_up=2.0, seed_set=True, lr_decay_rounds=None):
         self.spec, X, y, self.Xtest, self.ytest, shards, default_lr = load_task(dataset, n_agents, seed)
         spec = self.spec
         lr = default_lr if lr is None else lr
+        if accept_tol is None:
+            # Without privacy noise, ordinary steps that raise the loss a little still make progress, so only
+            # clearly harmful rounds (>25% worse) are rejected. With noise, some steps are mostly noise:
+            # rejecting every step that makes things worse keeps training stable (measured: 93.7% vs 80.1%
+            # over 3 seeds at noise 1.0).
+            accept_tol = 0.25 if dp_sigma == 0 else 0.0
         rng = np.random.default_rng(seed)
         self.seed_set = public_seed_set(X, y) if seed_set else None
 

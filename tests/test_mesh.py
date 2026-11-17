@@ -88,6 +88,12 @@ class Ledger(unittest.TestCase):
         self.assertEqual(chain.state.nodes, {})
 
 
+class Privacy(unittest.TestCase):
+    def test_vote_is_strict_when_privacy_noise_is_on(self):
+        self.assertEqual(World(adversaries=False, dp_sigma=1.0).chain.state.params["accept_tol"], 0.0)
+        self.assertEqual(World(adversaries=False).chain.state.params["accept_tol"], 0.25)
+
+
 class Agreement(unittest.TestCase):
     def test_privacy_noise_does_not_stop_agents_agreeing(self):
         w = World(adversaries=False, activation_noise=0.5)
