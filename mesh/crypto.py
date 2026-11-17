@@ -7,6 +7,7 @@ Public keys are published on the chain when a participant registers, so peers lo
 """
 import hashlib
 import json
+import os
 
 from cryptography.exceptions import InvalidSignature, InvalidTag  # noqa: F401  (re-exported)
 from cryptography.hazmat.primitives import hashes, serialization
@@ -55,8 +56,29 @@ def merkle_root(leaves):
 
 
 class Identity:
+    """A participant's keys. Both keys derive from one 32-byte secret, which is all a key file stores."""
+
+    @classmethod
+    def generate(cls):
+        return cls(os.urandom(32))
+
+    @classmethod
+    def load(cls, path):
+        with open(path) as f:
+            return cls(bytes.fromhex(json.load(f)["secret"]))
+
+    def save(self, path):
+        """Write the private key, readable only by its owner. Refuses to overwrite an existing key."""
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"secret": self._secret.hex(), "address": self.address}, f)
+
+    def public_card(self):
+        return {"address": self.address, "sign_pk": self.sign_pk, "kex_pk": self.kex_pk}
+
     def __init__(self, seed):
         s = seed.encode() if isinstance(seed, str) else seed
+        self._secret = s
         self._sk = Ed25519PrivateKey.from_private_bytes(hashlib.sha256(s + b"/sign").digest())
         self._xk = X25519PrivateKey.from_private_bytes(hashlib.sha256(s + b"/kex").digest())
         self.sign_pk = self._sk.public_key().public_bytes(**_RAW).hex()

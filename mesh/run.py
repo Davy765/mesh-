@@ -1,15 +1,23 @@
-"""Run Mesh as real, separate programs talking over TCP.
+"""Run Mesh as real, separate programs talking over the network.
 
-    python -m mesh.run local --rounds 40              # everything on this machine, one process per node
-    python -m mesh.run init --dir net --host 0.0.0.0  # write a network config to copy to other machines
-    python -m mesh.run node --dir net --name agent2   # start one node from that config
+Everything on one machine (one process per node):
+    python -m mesh.run local --rounds 40
 
-Demo shortcut: `init` writes every node's key seed into net/nodes.json so one person can start the
-whole network. In a real deployment each machine creates its own key and only shares the public part.
+Across several machines, private keys never leave the machine that owns them:
+    # on each machine, once per node it will run:
+    python -m mesh.run keygen --name agent2 --role agent --index 2 --endpoint 203.0.113.5:9100 > agent2.card.json
+    # collect the cards (public keys only) on any one machine and build the network config:
+    python -m mesh.run genesis --dir net --cards *.card.json --rounds 40
+    # copy net/genesis.json and net/nodes.json to every machine, then on each:
+    python -m mesh.run node --dir net --name agent2 --key keys/agent2.key
+
+`init` is a demo shortcut that does keygen + genesis for a whole network on one machine.
 """
 import argparse
+import glob
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -30,47 +38,70 @@ def log(name, **kw):
     print(json.dumps({"t": round(time.time(), 3), "name": name, **kw}), flush=True)
 
 
-# ---------------------------------------------------------------- config
-def init(d, n_agents=5, replicas=3, n_validators=7, host="127.0.0.1", base_port=9100, attackers=True,
-         interval=2.0, seed=0, dataset="ring", rounds=None):
+# ---------------------------------------------------------------- keys and config
+# Each machine runs `keygen` for its own nodes: the private key stays in a local file, and only a public
+# "card" (name, role, endpoint, public keys) is shared. `genesis` builds the network config from cards alone.
+PUBLIC_CARD_FIELDS = ("name", "role", "piece", "index", "behaviour", "endpoint", "address", "sign_pk", "kex_pk")
+
+
+def keygen(keys_dir, name, role, endpoint, piece=None, index=None, behaviour="honest"):
+    """Create a node's private key file (mode 600) and return its public card."""
+    os.makedirs(keys_dir, exist_ok=True)
+    ident = Identity.generate()
+    ident.save(os.path.join(keys_dir, f"{name}.key"))
+    card = {"name": name, "role": role, "endpoint": endpoint, "behaviour": behaviour, **ident.public_card()}
+    if piece is not None:
+        card["piece"] = piece
+    if index is not None:
+        card["index"] = int(index)
+    return card
+
+
+def build_genesis(d, cards, interval=2.0, seed=0, dataset="ring", rounds=None):
+    """Write genesis.json and nodes.json from public cards only: no private material ever goes in."""
     from .sim import load_task
     os.makedirs(d, exist_ok=True)
+    cards = [{k: c[k] for k in PUBLIC_CARD_FIELDS if k in c} for c in cards]
+    n_agents = sum(c["role"] == "agent" for c in cards)
     spec, *_, lr = load_task(dataset, n_agents, seed)
-    port = iter(range(base_port, base_port + 1000))
-    nodes = []
-    for i in range(n_validators):
-        nodes.append({"name": f"validator{i}", "role": "validator", "seed": f"validator-{i}-{seed}-{os.urandom(8).hex()}",
-                      "behaviour": "corrupt" if attackers and i == 1 else "honest"})
-    for i in range(spec.n_slices):
-        for r in range(replicas):
-            b = "honest"
-            if attackers and (i, r) == (1, 0):
-                b = "liar"
-            if attackers and (i, r) == (2, 0):
-                b = "poisoner"
-            nodes.append({"name": f"server{i}.{r}", "role": "server", "piece": f"slice{i}", "behaviour": b,
-                          "seed": f"server-{i}-{r}-{seed}-{os.urandom(8).hex()}"})
-    for k in range(n_agents):
-        nodes.append({"name": f"agent{k}", "role": "agent", "index": k,
-                      "behaviour": "poisoner" if attackers and k == n_agents - 1 else "honest",
-                      "seed": f"agent-{k}-{seed}-{os.urandom(8).hex()}"})
-    for nd in nodes:
-        nd["endpoint"] = f"{host}:{next(port)}"
-        ident = Identity(nd["seed"])
-        nd["address"], nd["sign_pk"], nd["kex_pk"] = ident.address, ident.sign_pk, ident.kex_pk
     genesis = {
         "spec": spec.to_obj(),
         "piece_hashes": {p: param_hash(init_piece(spec, p)) for p in spec.pieces},
-        "balances": {nd["address"]: (20000 if nd["role"] == "agent" else 400) for nd in nodes if nd["role"] != "validator"},
+        "balances": {c["address"]: (20000 if c["role"] == "agent" else 400) for c in cards if c["role"] != "validator"},
         "params": {"min_stake": 100, "price": 1, "slash_fraction": 0.5, "whistleblower_share": 0.2,
                    "emission": 30, "accept_tol": 0.25, "lr_decay_rounds": rounds},
-        "validators": [{k: nd[k] for k in ("address", "sign_pk", "kex_pk", "endpoint")}
-                       for nd in nodes if nd["role"] == "validator"],
+        "validators": [{k: c[k] for k in ("address", "sign_pk", "kex_pk", "endpoint")}
+                       for c in cards if c["role"] == "validator"],
         "interval": interval, "n_agents": n_agents, "data_seed": seed, "dataset": dataset, "lr": lr,
     }
     json.dump(genesis, open(os.path.join(d, "genesis.json"), "w"), indent=1)
-    json.dump(nodes, open(os.path.join(d, "nodes.json"), "w"), indent=1)
-    return genesis, nodes
+    json.dump(cards, open(os.path.join(d, "nodes.json"), "w"), indent=1)
+    return genesis, cards
+
+
+def demo_layout(n_agents=5, replicas=3, n_validators=7, attackers=True, n_slices=3):
+    """The standard demo network: who runs what (attacker roles are part of the demo, not of Mesh)."""
+    out = [{"name": f"validator{i}", "role": "validator", "behaviour": "corrupt" if attackers and i == 1 else "honest"}
+           for i in range(n_validators)]
+    for i in range(n_slices):
+        for r in range(replicas):
+            b = "liar" if attackers and (i, r) == (1, 0) else "poisoner" if attackers and (i, r) == (2, 0) else "honest"
+            out.append({"name": f"server{i}.{r}", "role": "server", "piece": f"slice{i}", "behaviour": b})
+    for k in range(n_agents):
+        out.append({"name": f"agent{k}", "role": "agent", "index": k,
+                    "behaviour": "poisoner" if attackers and k == n_agents - 1 else "honest"})
+    return out
+
+
+def init(d, n_agents=5, replicas=3, n_validators=7, host="127.0.0.1", base_port=9100, attackers=True,
+         interval=2.0, seed=0, dataset="ring", rounds=None):
+    """Demo shortcut: generate every node's key on this machine (in d/keys/) and build genesis.
+    For a real deployment, run `keygen` on each machine instead and collect only the cards."""
+    cards = []
+    for i, nd in enumerate(demo_layout(n_agents, replicas, n_validators, attackers)):
+        cards.append(keygen(os.path.join(d, "keys"), nd["name"], nd["role"], f"{host}:{base_port + i}",
+                            piece=nd.get("piece"), index=nd.get("index"), behaviour=nd["behaviour"]))
+    return build_genesis(d, cards, interval=interval, seed=seed, dataset=dataset, rounds=rounds)
 
 
 def load(d):
@@ -78,10 +109,12 @@ def load(d):
 
 
 # ---------------------------------------------------------------- one node
-def run_node(d, name, rounds=None):
+def run_node(d, name, rounds=None, key_path=None):
     genesis, nodes = load(d)
     nd = next(n for n in nodes if n["name"] == name)
-    ident = Identity(nd["seed"])
+    ident = Identity.load(key_path or os.path.join(d, "keys", f"{name}.key"))
+    if ident.sign_pk != nd["sign_pk"]:
+        raise SystemExit(f"{name}: this key file does not match the public key in nodes.json")
     host, port = parse_endpoint(nd["endpoint"])
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
@@ -162,6 +195,12 @@ def _report_validator(v, name, stop):
 
 # ---------------------------------------------------------------- everything locally
 def local(rounds, interval, attackers, base_port, d, dataset="ring"):
+    marker = os.path.join(d, ".mesh-local")
+    if os.path.exists(d) and os.listdir(d) and not os.path.exists(marker):
+        raise SystemExit(f"{d} exists and was not made by `local`; pick another --dir")
+    shutil.rmtree(d, ignore_errors=True)          # a previous local demo run: throwaway keys and logs
+    os.makedirs(d)
+    open(marker, "w").close()
     genesis, nodes = init(d, interval=interval, attackers=attackers, base_port=base_port, dataset=dataset,
                           rounds=rounds)
     os.makedirs(os.path.join(d, "logs"), exist_ok=True)
@@ -289,7 +328,21 @@ def main():
     c = sub.add_parser("node")
     c.add_argument("--dir", default="net")
     c.add_argument("--name", required=True)
+    c.add_argument("--key", default=None, help="private key file (default: DIR/keys/NAME.key)")
     c.add_argument("--rounds", type=int, default=None)
+    k = sub.add_parser("keygen", help="create a node's private key here and print its public card")
+    k.add_argument("--keys", default="keys", help="directory for the private key file")
+    k.add_argument("--name", required=True)
+    k.add_argument("--role", required=True, choices=["validator", "server", "agent"])
+    k.add_argument("--endpoint", required=True, help="host:port (or https URL) other nodes reach this node at")
+    k.add_argument("--piece", help="servers: which slice, e.g. slice0")
+    k.add_argument("--index", type=int, help="agents: which data shard")
+    g = sub.add_parser("genesis", help="build the network config from public cards")
+    g.add_argument("--dir", default="net")
+    g.add_argument("--cards", nargs="+", required=True)
+    g.add_argument("--interval", type=float, default=2.0)
+    g.add_argument("--dataset", choices=["ring", "mnist"], default="ring")
+    g.add_argument("--rounds", type=int, default=None)
     args = ap.parse_args()
     if args.cmd == "local":
         local(args.rounds, args.interval, not args.no_attackers, args.port, args.dir, args.dataset)
@@ -297,8 +350,22 @@ def main():
         init(args.dir, host=args.host, base_port=args.port, interval=args.interval, attackers=not args.no_attackers,
              dataset=args.dataset, rounds=args.rounds)
         print(f"wrote {args.dir}/genesis.json and {args.dir}/nodes.json")
+    elif args.cmd == "keygen":
+        if args.role == "server" and not args.piece or args.role == "agent" and args.index is None:
+            raise SystemExit("servers need --piece, agents need --index")
+        try:
+            card = keygen(args.keys, args.name, args.role, args.endpoint, piece=args.piece, index=args.index)
+        except FileExistsError:
+            raise SystemExit(f"{args.keys}/{args.name}.key already exists; refusing to overwrite a private key")
+        print(json.dumps(card, indent=1))
+        print(f"private key written to {os.path.join(args.keys, args.name + '.key')} (keep it secret)", file=sys.stderr)
+    elif args.cmd == "genesis":
+        files = [f for pattern in args.cards for f in glob.glob(pattern)]
+        build_genesis(args.dir, [json.load(open(f)) for f in files], interval=args.interval,
+                      dataset=args.dataset, rounds=args.rounds)
+        print(f"wrote {args.dir}/genesis.json and {args.dir}/nodes.json from {len(files)} cards")
     else:
-        run_node(args.dir, args.name, args.rounds)
+        run_node(args.dir, args.name, args.rounds, key_path=args.key)
 
 
 if __name__ == "__main__":
