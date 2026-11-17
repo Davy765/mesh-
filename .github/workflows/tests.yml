@@ -51,6 +51,13 @@ jobs:
           grep -q "validator3 after its restart: replayed_blocks=" out.txt
           grep -q "server0.1 after its restart: .*resynced=True" out.txt
           grep -Eq "training rounds: [0-9]+, accepted [1-9]" out.txt
+      - name: Keep the node logs if it failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.job }}-${{ strategy.job-index }}
+          path: net-ci/logs/
+          retention-days: 7
 
   cluster-rehearsal:
     # The multi-machine code path (per-machine keys, card exchange through machine 0, cross-machine report),
@@ -76,6 +83,13 @@ jobs:
           for m in 0 1 2; do grep -q "machine $m: node errors logged: 0" m$m.out; done
           grep -q "honest servers outvoted: none" m0.out
           grep -Eq "training rounds: [0-9]+, accepted [1-9]" m0.out
+      - name: Keep the node logs if it failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.job }}-${{ strategy.job-index }}
+          path: net-m*/logs/
+          retention-days: 7
 
   docker:
     # The image a test network's servers run (see deploy/TESTNET.md): it must build and run commands.
@@ -108,4 +122,10 @@ jobs:
           grep -q "newcomer-validator: in the validator set" out.txt
           grep -q "node errors logged: 0" out.txt
           ! grep -h '"error"' net-tn/logs/newcomer*.log
-
+      - name: Keep the node logs if it failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.job }}-${{ strategy.job-index }}
+          path: net-tn/logs/
+          retention-days: 7

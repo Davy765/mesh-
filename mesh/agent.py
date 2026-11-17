@@ -73,16 +73,18 @@ class Agent(PieceMember):
 
     def run_hop(self, piece, kind, version, arrays, train=False, route="fast"):
         """One hop through a slice, with failover and random spot checks. Returns (output, ms)."""
-        ms_total, tried, sweeps = 0.0, set(), 0
-        for _ in range(8):
+        ms_total, tried, sweeps, why = 0.0, set(), 0, {}
+        for _ in range(24):                        # enough for every replica on every retry below
             try:
                 addr = self.choose(piece, exclude=tried, route=route)
-            except NodeDown:
-                if sweeps or not tried:            # already retried once, or nobody to ask at all
-                    raise
-                sweeps += 1                        # every replica refused: maybe they're still switching
-                time.sleep(0.25)                   # to this round's weights. Wait briefly, try again.
-                ms_total += 250
+            except NodeDown as e:
+                if sweeps >= 3 or not tried:       # retried enough, or nobody to ask at all
+                    reasons = "; ".join(f"{a[:8]}: {r}" for a, r in why.items())
+                    raise NodeDown(f"{e}" + (f" ({reasons})" if reasons else "")) from None
+                wait = 0.25 * 2 ** sweeps          # every replica refused: maybe they're still switching to
+                sweeps += 1                        # this round's weights (slower on a busy machine). Wait a
+                time.sleep(wait)                   # little longer each time: 0.25 s, 0.5 s, 1 s.
+                ms_total += wait * 1000
                 tried = set()
                 continue
             tried.add(addr)
@@ -92,10 +94,12 @@ class Agent(PieceMember):
                 ms_total += self.net.timeout_ms
                 self.ewma[addr] = self.net.timeout_ms
                 self.stats["failovers"] += 1
+                why[addr] = "down"
                 continue
-            except Rejected:
+            except Rejected as e:
                 ms_total += 2 * self.latency_ms
                 self.stats["failovers"] += 1
+                why[addr] = str(e)
                 continue
             ms_total += ms
             self._pay(addr, rc)
@@ -203,21 +207,31 @@ class Agent(PieceMember):
         can all compute the same update) and all return the gradient, so every training hop is fully
         cross-checked: a replica that disagrees with two others is proven wrong on the spot."""
         self.round_inputs[piece] = (h, g)
-        answers, slowest = [], 0.0
+        answers, slowest, why = [], 0.0, {}
         targets = self.chain.state.members(piece)
         if self.behaviour == "withholder":                 # attack: train through only some replicas
             targets = [t for t in targets if t in self.withhold_to] or targets[:1]
-        for addr in targets:
-            try:
-                out, rc, ms = self._call(addr, "bwd", version, {"h": h, "g": g}, train=True)
-            except (NodeDown, Rejected):
-                self.stats["failovers"] += 1
-                continue
-            self._pay(addr, rc)
-            answers.append((addr, out, rc))
-            slowest = max(slowest, ms)                 # the calls could go out in parallel
+        pending = list(targets)
+        for attempt in range(4):
+            for addr in list(pending):
+                try:
+                    out, rc, ms = self._call(addr, "bwd", version, {"h": h, "g": g}, train=True)
+                except (NodeDown, Rejected) as e:
+                    self.stats["failovers"] += 1
+                    why[addr] = str(e) if isinstance(e, Rejected) else "down"
+                    continue
+                pending.remove(addr)
+                self._pay(addr, rc)
+                answers.append((addr, out, rc))
+                slowest = max(slowest, ms)                 # the calls could go out in parallel
+            # Replicas that refused may still be switching to this round's weights (slow on a busy machine).
+            # Give them a little more time: the update is only identical everywhere if they all get my input.
+            if not pending or attempt == 3 or all(why.get(a) == "down" for a in pending):
+                break
+            time.sleep(0.25 * 2 ** attempt)
         if not answers:
-            raise NodeDown(f"no working replica for {piece}")
+            reasons = "; ".join(f"{a[:8]}: {r}" for a, r in why.items())
+            raise NodeDown(f"no working replica for {piece} ({reasons})")
         groups = {}
         for a in answers:
             groups.setdefault(a[2]["body"]["output"], []).append(a)
