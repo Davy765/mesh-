@@ -11,6 +11,8 @@ reads the state like a light client: it asks every validator for its latest (hei
 trusts a hash only if enough validators (f+1, so at least one honest) report it, then downloads that
 state from one of them and checks it hashes to the agreed value.
 """
+import json
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -76,15 +78,50 @@ class ValidatorNode(Peer):
         raise Rejected("unknown request")
 
     def _catch_up(self, peer):
-        try:
-            meta, _, _ = self.net.call(self, peer, "blocks", {"from": self.v.state.height})
-        except (NodeDown, Rejected):
-            return
-        for b in meta["blocks"]:
-            sigs = b.pop("sigs")
-            b.pop("results", None)
-            if not self.v.commit(b, sigs, self.keys, self.quorum):
-                break
+        """Fetch and verify (quorum signatures + re-execution) every block I'm missing, 50 at a time."""
+        while True:
+            try:
+                meta, _, _ = self.net.call(self, peer, "blocks", {"from": self.v.state.height})
+            except (NodeDown, Rejected):
+                return
+            if not meta["blocks"]:
+                return
+            for b in meta["blocks"]:
+                sigs = b.pop("sigs")
+                b.pop("results", None)
+                if not self.v.commit(b, sigs, self.keys, self.quorum):
+                    return
+
+    # ---- saving to disk -----------------------------------------------------------------------
+    def close(self):
+        if getattr(self, "_log", None):
+            self._log.close()
+            self._log = None
+
+    def persist_to(self, path):
+        """Replay the blocks saved at `path` (each one re-checked: quorum signatures and re-execution),
+        then append every newly committed block to it."""
+        replayed = 0
+        if os.path.exists(path):
+            with open(path) as f:
+                for line in f:
+                    b = json.loads(line)
+                    sigs = b.pop("sigs")
+                    b.pop("results", None)
+                    if not self.v.commit(b, sigs, self.keys, self.quorum):
+                        break                     # a damaged tail: the rest comes from the other validators
+                    replayed += 1
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._log = open(path, "w")
+        for b in self.v.blocks:                   # rewrite only what verified, then keep appending
+            self._log.write(json.dumps(b) + "\n")
+        self._log.flush()
+
+        def save(block):
+            self._log.write(json.dumps(block) + "\n")
+            self._log.flush()
+        self.v.on_commit = save
+        return replayed
 
     # ---- proposing ------------------------------------------------------------------------------
     def run(self, host, port, stop):

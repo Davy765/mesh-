@@ -31,10 +31,13 @@ class PieceMember(Peer):
         self.rng = np.random.default_rng(seed)
         self.params = init_piece(spec, piece)
         self.version = param_hash(self.params)
-        if self.version != chain.state.canonical[piece]:
+        st = chain.state
+        if self.version != getattr(st, "genesis_hashes", st.canonical)[piece]:
             raise ValueError("my initial weights do not match genesis")
         self.cand, self.cand_hash = None, None
-        self.nonce = 0
+        # Continue my transaction numbering where the chain has it, so a restarted node's transactions
+        # are not all rejected as replays.
+        self.nonce = st.nonces.get(identity.address, 0)
         self.lock = threading.RLock()        # requests arrive on other threads when on a real network
         self._at_round = chain.state.round
         self._reset_round()
@@ -43,6 +46,14 @@ class PieceMember(Peer):
     def submit(self, kind, body):
         self.chain.submit(make_tx(self.id, kind, body, self.nonce))
         self.nonce += 1
+
+    def rejoin(self):
+        """After a restart: if training has moved on since genesis, download the agreed weights
+        (hash-checked) from another holder of my piece."""
+        target = self.chain.state.canonical[self.piece]
+        if target != self.version:
+            self.resync(target)
+        return self.version == target
 
     def register(self, role, stake, endpoint=""):
         self.submit("register", {"role": role, "piece": self.piece, "stake": stake, "name": self.name,

@@ -45,6 +45,7 @@ class State:
         self.balances = dict(genesis["balances"])
         self.stakes, self.nodes, self.nonces = {}, {}, {}
         self.canonical = dict(genesis["piece_hashes"])
+        self.genesis_hashes = dict(genesis["piece_hashes"])   # not part of the state root; for nodes starting up
         self.cur = self._fresh_round()
         self.history = []
         self.lr_scale = 1.0          # step-size control: halves after a rejected round, regrows after accepted
@@ -352,6 +353,7 @@ class Validator:
         self.corrupt = corrupt
         self.online = True
         self._pending = {}
+        self.on_commit = None          # called with each committed block (e.g. to save it to disk)
 
     def _execute(self, txs):
         s = self.state.copy()
@@ -402,6 +404,8 @@ class Validator:
         self._pending.clear()
         block = {k: v for k, v in block.items() if k not in ("sigs", "results")}
         self.blocks.append({**block, "sigs": sigs, "results": results})
+        if self.on_commit:
+            self.on_commit(self.blocks[-1])
         included = {tx_hash(t) for t in block["txs"]}
         self.mempool = [t for t in self.mempool if tx_hash(t) not in included]
         return True

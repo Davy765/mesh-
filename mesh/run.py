@@ -120,7 +120,8 @@ def run_node(d, name, rounds=None, key_path=None):
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
     if nd["role"] == "validator":
         v = ValidatorNode(ident, genesis, genesis["interval"], corrupt=nd["behaviour"] == "corrupt")
-        log(name, event="started", endpoint=nd["endpoint"])
+        replayed = v.persist_to(os.path.join(d, "data", name, "blocks.jsonl"))
+        log(name, event="started", endpoint=nd["endpoint"], replayed_blocks=replayed)
         threading.Thread(target=lambda: _report_validator(v, name, stop), daemon=True).start()
         v.run(host, port, stop)
         return
@@ -143,7 +144,10 @@ def run_node(d, name, rounds=None, key_path=None):
         m = Agent(ident, name, spec, chain, Xs[perm], ys[perm], seed_set=public_seed_set(Xall, yall), **common)
     TCPNetwork(chain.directory).attach(m)
     serve(m, host, port)
-    m.register("server" if nd["role"] == "server" else "client", 200, endpoint=nd["endpoint"])
+    if m.address in chain.state.nodes:            # restarted: already registered, catch up instead
+        log(name, event="rejoining", round=chain.state.round, resynced=m.rejoin())
+    else:
+        m.register("server" if nd["role"] == "server" else "client", 200, endpoint=nd["endpoint"])
     log(name, event="started", endpoint=nd["endpoint"], address=m.address)
 
     I = genesis["interval"]
@@ -207,7 +211,7 @@ def local(rounds, interval, attackers, base_port, d, dataset="ring"):
     procs = {}
 
     def start(nd):
-        f = open(os.path.join(d, "logs", nd["name"] + ".log"), "w")
+        f = open(os.path.join(d, "logs", nd["name"] + ".log"), "a")   # a restarted node keeps its earlier log
         procs[nd["name"]] = subprocess.Popen([sys.executable, "-m", "mesh.run", "node", "--dir", d, "--name", nd["name"],
                                               "--rounds", str(rounds)], stdout=f, stderr=subprocess.STDOUT,
                                              cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -221,17 +225,24 @@ def local(rounds, interval, attackers, base_port, d, dataset="ring"):
             start(nd)
     chain = RemoteChain(genesis)
     t0 = time.time()
-    killed = False
+    killed = restarted = False
     last_print = None
+    victims = ("server0.1", "validator3")
     try:
         while True:
             time.sleep(0.5)
             st = chain.state
             if not killed and st.round >= rounds // 2:
-                for victim in ("server0.1", "validator3"):
+                for victim in victims:
                     procs[victim].kill()
-                print(f"  !! round {st.round}: killed server0.1 and validator3 (SIGKILL)")
+                print(f"  !! round {st.round}: killed {' and '.join(victims)} (SIGKILL)")
                 killed = True
+            if killed and not restarted and st.round >= rounds * 3 // 4:
+                for nd in nodes:
+                    if nd["name"] in victims:
+                        start(nd)                         # same key, same saved blocks: it must catch up
+                print(f"  ++ round {st.round}: restarted {' and '.join(victims)}")
+                restarted = True
             evals = _read(d, "agent0", "eval")
             if evals and evals[-1]["round"] != last_print:
                 last_print = evals[-1]["round"]
@@ -253,6 +264,16 @@ def local(rounds, interval, attackers, base_port, d, dataset="ring"):
             if p.poll() is None:
                 p.kill()
     _summary(d, genesis, nodes)
+    _restart_summary(d)
+
+
+def _restart_summary(d):
+    for name in ("validator3", "server0.1"):
+        starts = _read(d, name, "started") + _read(d, name, "rejoining")
+        if len(starts) > 1:
+            print(f"  {name} after its restart: " + ", ".join(
+                f"{k}={v}" for r in starts[1:] for k, v in r.items() if k not in ("t", "name", "event", "endpoint",
+                                                                               "address")))
 
 
 def _ledger_summary(chain):

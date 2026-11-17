@@ -47,3 +47,53 @@ class Keys(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Restarts(unittest.TestCase):
+    def test_validator_replays_its_saved_blocks_after_a_restart(self):
+        from mesh.chain_net import ValidatorNode
+        with tempfile.TemporaryDirectory() as d:
+            genesis, _ = run.init(d, n_agents=1, replicas=1, n_validators=4)
+            ids = [Identity.load(os.path.join(d, "keys", f"validator{i}.key")) for i in range(4)]
+            nodes = [ValidatorNode(i, genesis, 2.0) for i in ids]
+            path = os.path.join(d, "data", "validator0", "blocks.jsonl")
+            nodes[0].persist_to(path)
+            for h in range(6):                                 # produce blocks the normal way
+                block = nodes[h % 4].v.propose()
+                sigs = {n.address: n.v.check(block) for n in nodes}
+                for n in nodes:
+                    n.v.commit(block, sigs, nodes[0].keys, nodes[0].quorum)
+            fresh = ValidatorNode(ids[0], genesis, 2.0)        # "restarted" with empty memory
+            self.assertEqual(fresh.persist_to(path), 6)
+            self.assertEqual(fresh.v.state.root(), nodes[0].v.state.root())
+            for n in (nodes[0], fresh):
+                n.close()
+            with open(path) as f:                              # damage block 3 on disk
+                lines = f.read().splitlines()
+            bad = json.loads(lines[3])
+            bad["state_root"] = "0" * 64
+            lines[3] = json.dumps(bad)
+            with open(path, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            again = ValidatorNode(ids[0], genesis, 2.0)
+            self.assertEqual(again.persist_to(path), 3)        # stops at the damage; the rest comes from peers
+            again.close()
+
+    def test_server_rejoins_after_a_restart_mid_training(self):
+        from mesh.server import SliceServer
+        from mesh.sim import World
+        w = World(adversaries=False)
+        for _ in range(3):
+            w.round()
+        old = w.servers[(0, 1)]
+        new = SliceServer(old.id, old.name, old.piece, old.spec, old.chain, lr=old.lr, clip_norm=old.C,
+                          dp_sigma=old.sigma, seed=1, latency_ms=old.latency_ms)   # empty memory, same key
+        self.assertEqual(new.nonce, w.chain.state.nonces.get(old.address, 0))
+        w.net.attach(new)
+        w.servers[(0, 1)] = new
+        self.assertTrue(new.rejoin())
+        for _ in range(3):
+            w.round()
+        st = w.chain.state
+        self.assertEqual(new.version, st.canonical["slice0"])
+        self.assertFalse(any(new.address in h["trimmed"].get("slice0", []) for h in st.history[-3:]))
