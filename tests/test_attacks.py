@@ -56,3 +56,31 @@ class Withholding(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MixedHardware(unittest.TestCase):
+    """One replica per slice behaves like a machine whose arithmetic differs in the last bits
+    (relative error 1e-12, more than real CPU/BLAS differences)."""
+
+    def run_world(self, quantize):
+        w = World(adversaries=False)
+        odd = [w.servers[(0, 0)], w.servers[(1, 1)]]
+        for s in odd:
+            s.float_jitter = 1e-12
+        for s in w.servers.values():
+            s.quantize = quantize
+        for _ in range(4):
+            w.round()
+        st = w.chain.state
+        outvoted = set().union(*(set(x) for h in st.history for p, x in h["trimmed"].items() if p != "ends"))
+        return w, {s.address for s in odd}, outvoted, [e for e in st.events if "SLASHED" in e]
+
+    def test_unrounded_updates_split_honest_replicas(self):
+        _, odd, outvoted, _ = self.run_world(quantize=False)
+        self.assertTrue(odd & outvoted)
+
+    def test_rounded_updates_keep_honest_replicas_agreeing(self):
+        w, odd, outvoted, slashes = self.run_world(quantize=True)
+        self.assertFalse(outvoted, "no honest replica should be outvoted")
+        self.assertFalse(slashes, "no honest replica should be slashed")
+        self.assertTrue(any(h["accepted"] for h in w.chain.state.history))

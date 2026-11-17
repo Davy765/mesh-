@@ -48,9 +48,23 @@ def param_hash(params):
     return d.hexdigest()
 
 
+# Honest machines with different CPUs or maths libraries can disagree in the last few bits of a result.
+# Anything that must match bit-for-bit across machines is first snapped to a fixed grid, so such tiny
+# differences almost always land on the same grid point.
+UPDATE_GRID = 2.0 ** -24          # weight updates: ~6e-8, far below their typical size (1e-4 to 1e-2)
+OUTPUT_DECIMALS = 4               # spot-check comparisons of activations and gradients
+
+
+def quantize(d, grid=UPDATE_GRID):
+    """Snap every value of a parameter dict to a fixed grid (exact, deterministic float operations only)."""
+    return {k: np.round(np.asarray(v, np.float64) / grid) * grid for k, v in d.items()}
+
+
 def output_hash(a):
-    """Hash of a computed tensor, rounded so tiny float noise does not matter."""
-    return hashlib.sha256(np.round(np.asarray(a, np.float64), 6).tobytes()).hexdigest()
+    """Hash of a computed tensor, rounded so that harmless last-bit differences between honest machines
+    don't look like a lie. A real lie (corrupted values) is still far outside the rounding."""
+    r = np.round(np.asarray(a, np.float64), OUTPUT_DECIMALS) + 0.0      # + 0.0 turns -0.0 into 0.0
+    return hashlib.sha256(r.tobytes()).hexdigest()
 
 
 # ---- slices (run by servers) ----------------------------------------------

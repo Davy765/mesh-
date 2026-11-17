@@ -272,7 +272,9 @@ class Agent(PieceMember):
             return None
         _, _, g_head, _ = loss_and_head_grads(ends, hs[-1], ys)
         ref = -np.concatenate([g_head["W_out"].ravel(), g_head["b_out"].ravel()])
-        return [max(0.0, cosine(np.concatenate([u["W_out"].ravel(), u["b_out"].ravel()]), ref)) for u in updates]
+        # rounded so that agents whose forward passes went through different (honest) machines still agree
+        return [round(max(0.0, cosine(np.concatenate([u["W_out"].ravel(), u["b_out"].ravel()]), ref)), 4)
+                for u in updates]
 
     # ---- job market ------------------------------------------------------------------------
     def claim_receipt(self, job, chunk, input_hash, labels):

@@ -16,7 +16,7 @@ import numpy as np
 from .aggregate import dp_release, robust_aggregate, trust_aggregate
 from .chain import make_tx
 from .crypto import sha
-from .model import init_piece, param_hash
+from .model import init_piece, param_hash, quantize
 from .network import NodeDown, Peer, Rejected
 
 
@@ -131,6 +131,7 @@ class PieceMember(Peer):
         if self.behaviour == "poisoner" and self.address in valid and self.address not in kept:
             kept.append(self.address)                     # claims its update should count
             agg = {k: agg[k] + reveals[self.address][0][k] for k in agg}
+        agg = quantize(agg)                                 # see model.UPDATE_GRID
         self.cand = {k: self.params[k] + agg[k] for k in self.params}
         self.cand_hash = param_hash(self.cand)
         self.submit("candidate", {"round": st.round, "piece": self.piece, "digest": self.cand_hash,

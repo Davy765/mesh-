@@ -12,7 +12,7 @@ import numpy as np
 from .aggregate import clip, dp_release
 from .crypto import sha
 from .member import PieceMember
-from .model import output_hash, param_hash, slice_backward, slice_forward
+from .model import output_hash, param_hash, quantize, slice_backward, slice_forward
 from .network import NodeDown, Rejected
 
 
@@ -24,6 +24,8 @@ class SliceServer(PieceMember):
     def __init__(self, *a, compute_ms_per_item=0.02, lie_rate=0.5, peer_relay=True, **kw):
         super().__init__(*a, **kw)
         self.peer_relay = peer_relay     # fetch inputs/salts I was left out of from other replicas
+        self.quantize = True             # snap updates to a grid so different hardware still agrees
+        self.float_jitter = 0.0          # tests only: imitate a machine whose arithmetic differs in the last bits
         self.compute_ms_per_item = compute_ms_per_item
         self.lie_rate = lie_rate
         self.served = 0
@@ -32,6 +34,11 @@ class SliceServer(PieceMember):
         super()._reset_round()
         self.contribs = {}            # agent -> (input fingerprint, clipped gradient)
         self.salts, self.my_salt = {}, None
+
+    def _jitter(self, a):
+        if not self.float_jitter:
+            return a
+        return a * (1 + self.float_jitter * self.rng.standard_normal(np.shape(a)))
 
     def receipt(self, mode, version, input_hash, out):
         body = {"by": self.address, "piece": self.piece, "version": version, "mode": mode,
@@ -87,6 +94,7 @@ class SliceServer(PieceMember):
             if "h" not in arrays or input_fingerprint(arrays["h"], arrays["g"]) != want:
                 continue
             grads, _ = slice_backward(self.params, arrays["h"], arrays["g"])
+            grads = {k: self._jitter(v) for k, v in grads.items()}
             with self.lock:
                 self.contribs[agent] = (want, clip(grads, self.C), arrays["h"], arrays["g"])
             return self.contribs[agent][1]
@@ -135,6 +143,8 @@ class SliceServer(PieceMember):
         update = {k: -self.current_lr() * v for k, v in mean.items()}
         if self.behaviour == "poisoner":                   # push the model the wrong way, hard
             update = {k: -50 * v for k, v in update.items()}
+        if self.quantize:                                   # see model.UPDATE_GRID
+            update = quantize(update)
         self.cand = {k: self.params[k] + update[k] for k in self.params}
         self.cand_hash = param_hash(self.cand)
         self.submit("candidate", {"round": st.round, "piece": self.piece, "digest": self.cand_hash, "kept": []})
@@ -174,12 +184,13 @@ class SliceServer(PieceMember):
         self.served += 1
         if kind == "fwd":
             h = arrays["h"]
-            out = self._maybe_lie(slice_forward(params, h))
+            out = self._maybe_lie(self._jitter(slice_forward(params, h)))
             ms = 2 + self.compute_ms_per_item * len(h)
             return {"receipt": self.receipt("fwd", meta["version"], output_hash(h), out)}, {"out": out}, ms
         if kind == "bwd":
             h, g = arrays["h"], arrays["g"]
             grads, g_in = slice_backward(params, h, g)
+            grads, g_in = {k: self._jitter(v) for k, v in grads.items()}, self._jitter(g_in)
             inp = input_fingerprint(h, g)
             if meta.get("train"):
                 if meta["version"] != self.version:
