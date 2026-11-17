@@ -9,6 +9,10 @@
 **Try it in your browser:** click "Open in GitHub Codespaces" above, wait for it to set up, then type
 `python simulate_mesh.py` in the terminal. Nothing to install; it runs on GitHub's free Codespaces allowance.
 
+> [!WARNING]
+> **Research prototype.** Mesh is unaudited. Its tokens are play money: don't attach real value to them, and don't
+> train it on sensitive data. See [SECURITY.md](SECURITY.md) and the [threat model](docs/THREAT_MODEL.md).
+
 > **Get involved.** This is an open research prototype with real unsolved problems: attacks to find, defences
 > to design, experiments to run. Newcomers are welcome.
 > - Start with an issue labelled [`good first issue`](https://github.com/Davy765/mesh-/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22),
