@@ -129,3 +129,71 @@ class HTTPCarrier(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+class ValidatorSet(unittest.TestCase):
+    def test_join_and_leave_take_effect_at_epoch_boundaries(self):
+        from mesh.chain import make_tx
+        from mesh.chain_net import ValidatorNode
+        with tempfile.TemporaryDirectory() as d:
+            genesis, _ = run.init(d, n_agents=1, replicas=1, n_validators=4)
+            newbie = Identity.generate()
+            genesis["balances"][newbie.address] = 5000
+            genesis["params"]["epoch_blocks"] = 5
+            ids = [Identity.load(os.path.join(d, "keys", f"validator{i}.key")) for i in range(4)]
+            nodes = [ValidatorNode(i, genesis, 2.0) for i in ids]
+            fresh = ValidatorNode(newbie, genesis, 2.0)
+
+            def produce(txs=()):
+                active = [n for n in nodes + [fresh] if n.address in n.keys]
+                for n in nodes + [fresh]:
+                    n.v.mempool.extend(txs)
+                keys, quorum = nodes[0].keys, nodes[0].quorum
+                proposer = active[nodes[0].v.state.height % len(active)]
+                block = proposer.v.propose()
+                sigs = {n.address: s for n in active for s in [n.v.check(block)] if s}
+                self.assertGreaterEqual(len(sigs), quorum)
+                for n in nodes + [fresh]:
+                    self.assertTrue(n.v.commit(block, sigs, keys, quorum))
+
+            join = make_tx(newbie, "validator_join", {"stake": 1000, "sign_pk": newbie.sign_pk,
+                                                      "kex_pk": newbie.kex_pk, "endpoint": "127.0.0.1:1"}, 0)
+            produce([join])
+            self.assertEqual(len(nodes[0].keys), 4)               # queued, not active yet
+            while nodes[0].v.state.height < 5:
+                produce()
+            self.assertEqual(len(nodes[0].keys), 5)               # active from the epoch boundary
+            self.assertEqual(nodes[0].quorum, 4)
+            self.assertIn(newbie.address, fresh.keys)
+            produce()                                             # the newcomer now signs blocks too
+
+            leave = make_tx(ids[3], "validator_leave", {}, 0)
+            produce([leave])
+            while nodes[0].v.state.height < 10:
+                produce()
+            self.assertEqual(len(nodes[0].keys), 4)
+            self.assertNotIn(ids[3].address, nodes[0].keys)
+
+            leave2 = make_tx(ids[2], "validator_leave", {}, 0)    # would drop to 3: postponed
+            produce([leave2])
+            while nodes[0].v.state.height < 15:
+                produce()
+            self.assertEqual(len(nodes[0].keys), 4)
+            self.assertTrue(all(n.v.state.root() == nodes[0].v.state.root() for n in nodes + [fresh]))
+
+    def test_transfer_from_an_unregistered_account(self):
+        from mesh.chain import State, make_tx
+        spec = run.Spec()
+        genesis = {"spec": spec.to_obj(), "piece_hashes": {p: run.param_hash(run.init_piece(spec, p))
+                                                           for p in spec.pieces},
+                   "balances": {}, "params": {"min_stake": 100}}
+        faucet, alice = Identity.generate(), Identity.generate()
+        genesis["balances"][faucet.address] = 1000
+        st = State(genesis)
+        ok = make_tx(faucet, "transfer", {"to": alice.address, "amount": 300, "sign_pk": faucet.sign_pk}, 0)
+        self.assertIsNone(st.apply(ok))
+        self.assertEqual(st.balances[alice.address], 300)
+        too_much = make_tx(faucet, "transfer", {"to": alice.address, "amount": 5000, "sign_pk": faucet.sign_pk}, 1)
+        self.assertEqual(st.apply(too_much), "insufficient balance")
+        forged = make_tx(alice, "transfer", {"to": alice.address, "amount": 1, "sign_pk": faucet.sign_pk}, 0)
+        self.assertEqual(st.apply(forged), "bad signature")

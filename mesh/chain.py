@@ -52,6 +52,12 @@ class State:
         self.evidence_seen = []
         self.jobs = {}
         self.events = []
+        # The validator set lives in the ledger, so validators can join and leave. Changes queue up and take
+        # effect together at the next epoch boundary, so every validator switches at the same block.
+        self.validators = [{k: v[k] for k in ("address", "sign_pk", "kex_pk", "endpoint")}
+                           for v in genesis.get("validators", [])]
+        self.validator_stakes = {}
+        self.pending_validators = {"join": [], "leave": []}
 
     @classmethod
     def from_obj(cls, obj, genesis, events=()):
@@ -72,7 +78,7 @@ class State:
     def to_obj(self):
         return {k: getattr(self, k) for k in ["height", "round", "phase", "balances", "stakes", "nodes",
                                                "nonces", "canonical", "cur", "history", "lr_scale", "evidence_seen",
-                                               "jobs"]}
+                                               "jobs", "validators", "validator_stakes", "pending_validators"]}
 
     def root(self):
         return sha(canon(self.to_obj()))
@@ -95,7 +101,10 @@ class State:
         try:
             sender, body = tx["sender"], tx["body"]
             signed = {k: tx[k] for k in ("type", "sender", "nonce", "body")}
-            pk = body.get("sign_pk") if tx["type"] == "register" else self.nodes.get(sender, {}).get("sign_pk")
+            # A registered node is checked against its registered key; anyone else (a new node registering,
+            # a faucet or wallet account, a validator joining) includes its public key in the body.
+            pk = self.nodes.get(sender, {}).get("sign_pk") or \
+                next((v["sign_pk"] for v in self.validators if v["address"] == sender), None) or body.get("sign_pk")
         except (KeyError, TypeError, AttributeError):
             return "malformed"
         if not pk or address_of(pk) != sender or not verify_obj(pk, tx.get("sig", ""), signed):
@@ -110,6 +119,59 @@ class State:
             return handler(sender, body)
         except (KeyError, TypeError, ValueError) as e:
             return f"invalid body: {e}"
+
+    def _tx_transfer(self, s, b):
+        """Send tokens. On a test network this is how a faucet hands out play money."""
+        to, amount = str(b["to"]), int(b["amount"])
+        if amount <= 0 or len(to) != 40:
+            return "bad transfer"
+        if self.balances.get(s, 0) < amount:
+            return "insufficient balance"
+        self.balances[s] -= amount
+        self.balances[to] = self.balances.get(to, 0) + amount
+
+    # ---- the validator set ---------------------------------------------------------------------------
+    def validator_set(self):
+        """(addresses -> sign_pk, quorum) for checking the next block."""
+        keys = {v["address"]: v["sign_pk"] for v in self.validators}
+        n = len(keys)
+        return keys, n - (n - 1) // 3
+
+    def _tx_validator_join(self, s, b):
+        stake = int(b["stake"])
+        if any(v["address"] == s for v in self.validators) or any(j["address"] == s
+                                                                  for j in self.pending_validators["join"]):
+            return "already a validator"
+        if stake < self.params.get("validator_min_stake", 1000) or self.balances.get(s, 0) < stake:
+            return "validator stake too small or unfunded"
+        self.balances[s] -= stake
+        self.validator_stakes[s] = stake
+        self.pending_validators["join"].append({"address": s, "sign_pk": b["sign_pk"], "kex_pk": b["kex_pk"],
+                                                "endpoint": str(b["endpoint"])[:200]})
+        self.log(f"validator {s[:8]} will join at block {self._next_epoch()}")
+
+    def _tx_validator_leave(self, s, b):
+        if not any(v["address"] == s for v in self.validators):
+            return "not a validator"
+        if s not in self.pending_validators["leave"]:
+            self.pending_validators["leave"].append(s)
+        self.log(f"validator {s[:8]} will leave at block {self._next_epoch()}")
+
+    def _next_epoch(self):
+        e = self.params.get("epoch_blocks", 50)
+        return (self.height // e + 1) * e
+
+    def _apply_validator_changes(self):
+        leave = set(self.pending_validators["leave"])
+        new = [v for v in self.validators if v["address"] not in leave] + self.pending_validators["join"]
+        if len(new) < 4:                    # below 4 the chain can't tolerate even one bad validator
+            self.log("validator change postponed: the set would drop below 4")
+            return
+        for a in leave:                     # leavers get their validator stake back
+            self.balances[a] = self.balances.get(a, 0) + self.validator_stakes.pop(a, 0)
+        self.validators = new
+        self.pending_validators = {"join": [], "leave": []}
+        self.log(f"validator set is now {len(new)}: quorum {len(new) - (len(new) - 1) // 3}")
 
     def _tx_register(self, s, b):
         role, piece, stake = b["role"], b["piece"], int(b["stake"])
@@ -285,6 +347,9 @@ class State:
     # ---- end of block: move the training round along ---------------------------------
     def end_block(self):
         self.height += 1
+        if self.height % self.params.get("epoch_blocks", 50) == 0 and \
+                (self.pending_validators["join"] or self.pending_validators["leave"]):
+            self._apply_validator_changes()
         if self.phase == "commit":
             self.phase = "reveal"
         elif self.phase == "reveal":
