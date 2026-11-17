@@ -97,3 +97,35 @@ class Restarts(unittest.TestCase):
         st = w.chain.state
         self.assertEqual(new.version, st.canonical["slice0"])
         self.assertFalse(any(new.address in h["trimmed"].get("slice0", []) for h in st.history[-3:]))
+
+
+class HTTPCarrier(unittest.TestCase):
+    def test_encrypted_request_over_http_with_kept_alive_connection(self):
+        import socket
+        from mesh.network import Peer
+        from mesh.transport import TCPNetwork, serve
+
+        class Echo(Peer):
+            def handle(self, kind, sender, meta, arrays):
+                return {"echo": meta["x"]}, {}, 1.0
+
+        def free_port():
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                return s.getsockname()[1]
+
+        a, b = Echo(Identity.generate()), Echo(Identity.generate())
+        port = free_port()
+        book = {a.address: (a.id.sign_pk, a.id.kex_pk, ""), b.address: (b.id.sign_pk, b.id.kex_pk,
+                                                                          f"http://127.0.0.1:{port}")}
+        net = TCPNetwork(book.get)
+        net.attach(a)
+        net.attach(b)
+        srv = serve(b, "127.0.0.1", port, http_mode=True)
+        try:
+            for x in range(3):                                   # several calls reuse one connection
+                meta, _, _ = net.call(a, b.address, "ping", {"x": x})
+                self.assertEqual(meta["echo"], x)
+        finally:
+            srv.shutdown()
+            srv.server_close()

@@ -124,8 +124,8 @@ class ValidatorNode(Peer):
         return replayed
 
     # ---- proposing ------------------------------------------------------------------------------
-    def run(self, host, port, stop):
-        self.server = serve(self, host, port, public_handler=self.public)
+    def run(self, host, port, stop, http_mode=False):
+        self.server = serve(self, host, port, public_handler=self.public, http_mode=http_mode)
         last_slot = None
         while not stop.is_set():
             slot = int(time.time() / self.interval)

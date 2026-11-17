@@ -18,6 +18,7 @@ import glob
 import json
 import os
 import shutil
+import urllib.parse
 import signal
 import subprocess
 import sys
@@ -29,7 +30,7 @@ import numpy as np
 from .chain_net import RemoteChain, ValidatorNode
 from .crypto import Identity
 from .model import Spec, init_piece, param_hash
-from .transport import TCPNetwork, parse_endpoint, serve
+from .transport import TCPNetwork, is_http, parse_endpoint, serve
 
 CLIP = 2.0
 
@@ -41,15 +42,18 @@ def log(name, **kw):
 # ---------------------------------------------------------------- keys and config
 # Each machine runs `keygen` for its own nodes: the private key stays in a local file, and only a public
 # "card" (name, role, endpoint, public keys) is shared. `genesis` builds the network config from cards alone.
-PUBLIC_CARD_FIELDS = ("name", "role", "piece", "index", "behaviour", "endpoint", "address", "sign_pk", "kex_pk")
+PUBLIC_CARD_FIELDS = ("name", "role", "piece", "index", "behaviour", "endpoint", "listen", "address", "sign_pk",
+                      "kex_pk")
 
 
-def keygen(keys_dir, name, role, endpoint, piece=None, index=None, behaviour="honest"):
+def keygen(keys_dir, name, role, endpoint, piece=None, index=None, behaviour="honest", listen=None):
     """Create a node's private key file (mode 600) and return its public card."""
     os.makedirs(keys_dir, exist_ok=True)
     ident = Identity.generate()
     ident.save(os.path.join(keys_dir, f"{name}.key"))
     card = {"name": name, "role": role, "endpoint": endpoint, "behaviour": behaviour, **ident.public_card()}
+    if listen:                                  # where to bind, when it differs from what others dial
+        card["listen"] = listen
     if piece is not None:
         card["piece"] = piece
     if index is not None:
@@ -94,13 +98,15 @@ def demo_layout(n_agents=5, replicas=3, n_validators=7, attackers=True, n_slices
 
 
 def init(d, n_agents=5, replicas=3, n_validators=7, host="127.0.0.1", base_port=9100, attackers=True,
-         interval=2.0, seed=0, dataset="ring", rounds=None):
+         interval=2.0, seed=0, dataset="ring", rounds=None, http=False):
     """Demo shortcut: generate every node's key on this machine (in d/keys/) and build genesis.
     For a real deployment, run `keygen` on each machine instead and collect only the cards."""
     cards = []
     for i, nd in enumerate(demo_layout(n_agents, replicas, n_validators, attackers)):
-        cards.append(keygen(os.path.join(d, "keys"), nd["name"], nd["role"], f"{host}:{base_port + i}",
-                            piece=nd.get("piece"), index=nd.get("index"), behaviour=nd["behaviour"]))
+        addr = f"{host}:{base_port + i}"
+        cards.append(keygen(os.path.join(d, "keys"), nd["name"], nd["role"], f"http://{addr}" if http else addr,
+                            piece=nd.get("piece"), index=nd.get("index"), behaviour=nd["behaviour"],
+                            listen=addr if http else None))
     return build_genesis(d, cards, interval=interval, seed=seed, dataset=dataset, rounds=rounds)
 
 
@@ -115,7 +121,9 @@ def run_node(d, name, rounds=None, key_path=None):
     ident = Identity.load(key_path or os.path.join(d, "keys", f"{name}.key"))
     if ident.sign_pk != nd["sign_pk"]:
         raise SystemExit(f"{name}: this key file does not match the public key in nodes.json")
-    host, port = parse_endpoint(nd["endpoint"])
+    http_mode = is_http(nd["endpoint"])
+    host, port = parse_endpoint(nd.get("listen") or (
+        f"0.0.0.0:{urllib.parse.urlsplit(nd['endpoint']).port or 80}" if http_mode else nd["endpoint"]))
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
     if nd["role"] == "validator":
@@ -123,7 +131,7 @@ def run_node(d, name, rounds=None, key_path=None):
         replayed = v.persist_to(os.path.join(d, "data", name, "blocks.jsonl"))
         log(name, event="started", endpoint=nd["endpoint"], replayed_blocks=replayed)
         threading.Thread(target=lambda: _report_validator(v, name, stop), daemon=True).start()
-        v.run(host, port, stop)
+        v.run(host, port, stop, http_mode=http_mode)
         return
 
     from .agent import Agent
@@ -143,7 +151,7 @@ def run_node(d, name, rounds=None, key_path=None):
         perm = np.random.default_rng(nd["index"]).permutation(len(Xs))
         m = Agent(ident, name, spec, chain, Xs[perm], ys[perm], seed_set=public_seed_set(Xall, yall), **common)
     TCPNetwork(chain.directory).attach(m)
-    serve(m, host, port)
+    serve(m, host, port, http_mode=http_mode)
     if m.address in chain.state.nodes:            # restarted: already registered, catch up instead
         log(name, event="rejoining", round=chain.state.round, resynced=m.rejoin())
     else:
@@ -198,7 +206,7 @@ def _report_validator(v, name, stop):
 
 
 # ---------------------------------------------------------------- everything locally
-def local(rounds, interval, attackers, base_port, d, dataset="ring"):
+def local(rounds, interval, attackers, base_port, d, dataset="ring", http=False):
     marker = os.path.join(d, ".mesh-local")
     if os.path.exists(d) and os.listdir(d) and not os.path.exists(marker):
         raise SystemExit(f"{d} exists and was not made by `local`; pick another --dir")
@@ -206,7 +214,7 @@ def local(rounds, interval, attackers, base_port, d, dataset="ring"):
     os.makedirs(d)
     open(marker, "w").close()
     genesis, nodes = init(d, interval=interval, attackers=attackers, base_port=base_port, dataset=dataset,
-                          rounds=rounds)
+                          rounds=rounds, http=http)
     os.makedirs(os.path.join(d, "logs"), exist_ok=True)
     procs = {}
 
@@ -338,6 +346,7 @@ def main():
     a.add_argument("--port", type=int, default=9100)
     a.add_argument("--dir", default="net-local")
     a.add_argument("--dataset", choices=["ring", "mnist"], default="ring")
+    a.add_argument("--http", action="store_true", help="talk HTTP instead of raw TCP")
     b = sub.add_parser("init")
     b.add_argument("--dir", default="net")
     b.add_argument("--host", default="127.0.0.1")
@@ -358,6 +367,7 @@ def main():
     k.add_argument("--endpoint", required=True, help="host:port (or https URL) other nodes reach this node at")
     k.add_argument("--piece", help="servers: which slice, e.g. slice0")
     k.add_argument("--index", type=int, help="agents: which data shard")
+    k.add_argument("--listen", help="host:port to bind, if different from the endpoint (e.g. behind HTTPS)")
     g = sub.add_parser("genesis", help="build the network config from public cards")
     g.add_argument("--dir", default="net")
     g.add_argument("--cards", nargs="+", required=True)
@@ -366,7 +376,7 @@ def main():
     g.add_argument("--rounds", type=int, default=None)
     args = ap.parse_args()
     if args.cmd == "local":
-        local(args.rounds, args.interval, not args.no_attackers, args.port, args.dir, args.dataset)
+        local(args.rounds, args.interval, not args.no_attackers, args.port, args.dir, args.dataset, http=args.http)
     elif args.cmd == "init":
         init(args.dir, host=args.host, base_port=args.port, interval=args.interval, attackers=not args.no_attackers,
              dataset=args.dataset, rounds=args.rounds)
@@ -375,7 +385,8 @@ def main():
         if args.role == "server" and not args.piece or args.role == "agent" and args.index is None:
             raise SystemExit("servers need --piece, agents need --index")
         try:
-            card = keygen(args.keys, args.name, args.role, args.endpoint, piece=args.piece, index=args.index)
+            card = keygen(args.keys, args.name, args.role, args.endpoint, piece=args.piece, index=args.index,
+                          listen=args.listen)
         except FileExistsError:
             raise SystemExit(f"{args.keys}/{args.name}.key already exists; refusing to overwrite a private key")
         print(json.dumps(card, indent=1))
