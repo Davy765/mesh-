@@ -36,6 +36,7 @@ class Agent(PieceMember):
         self.stats = {"hops_fast": 0, "ms_fast": 0.0, "hops_spread": 0, "ms_spread": 0.0,
                       "failovers": 0, "checks": 0, "caught": 0}
         self.my_jobs, self.job_results = {}, {}
+        self.withhold_to = set()          # attack demo: the replicas a "withholder" agent trains through
         self.last_loss = None
 
     # ---- routing -------------------------------------------------------------------
@@ -203,7 +204,10 @@ class Agent(PieceMember):
         cross-checked: a replica that disagrees with two others is proven wrong on the spot."""
         self.round_inputs[piece] = (h, g)
         answers, slowest = [], 0.0
-        for addr in self.chain.state.members(piece):
+        targets = self.chain.state.members(piece)
+        if self.behaviour == "withholder":                 # attack: train through only some replicas
+            targets = [t for t in targets if t in self.withhold_to] or targets[:1]
+        for addr in targets:
             try:
                 out, rc, ms = self._call(addr, "bwd", version, {"h": h, "g": g}, train=True)
             except (NodeDown, Rejected):
@@ -336,6 +340,8 @@ class Agent(PieceMember):
         elif not node or not node["active"] or node["role"] != "client":
             raise Rejected("only registered agents")
         if kind == "contrib_data":            # a replica missed my training input: it can have it
+            if self.behaviour == "withholder":
+                raise Rejected("not giving it to you")
             if sender not in st.members(meta["piece"]) or meta["round"] != st.round \
                     or meta["piece"] not in getattr(self, "round_inputs", {}):
                 raise Rejected("not yours")

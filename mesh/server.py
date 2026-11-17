@@ -21,8 +21,9 @@ def input_fingerprint(h, g):
 
 
 class SliceServer(PieceMember):
-    def __init__(self, *a, compute_ms_per_item=0.02, lie_rate=0.5, **kw):
+    def __init__(self, *a, compute_ms_per_item=0.02, lie_rate=0.5, peer_relay=True, **kw):
         super().__init__(*a, **kw)
+        self.peer_relay = peer_relay     # fetch inputs/salts I was left out of from other replicas
         self.compute_ms_per_item = compute_ms_per_item
         self.lie_rate = lie_rate
         self.served = 0
@@ -56,27 +57,58 @@ class SliceServer(PieceMember):
             return
         with self.lock:
             self.salts[self.address] = self.my_salt
-        for peer in self.peers_of_piece():
+        peers = self.peers_of_piece()
+        if self.behaviour == "withholder":                 # attack: tell only one peer
+            peers = peers[:1]
+        for peer in peers:
             try:
                 self.net.call(self, peer, "salt", {"round": self.chain.state.round, "salt": self.my_salt})
             except (NodeDown, Rejected):
                 pass
 
     def _contribution(self, agent, want):
-        """The clipped gradient for one agent's declared input; fetch the input from the agent if I missed it."""
+        """The clipped gradient for one agent's declared input. If I missed the input, get it from the agent
+        or, failing that, from any other replica of my slice. The on-chain fingerprint proves it is the real
+        input, so the source doesn't need to be trusted, and an agent can't split the replicas by sending its
+        input to only some of them: if any honest replica got it, all of them do."""
         with self.lock:
             have = self.contribs.get(agent)
         if have and have[0] == want:
             return have[1]
-        try:
-            _, arrays, _ = self.net.call(self, agent, "contrib_data", {"round": self.chain.state.round,
-                                                                       "piece": self.piece})
-        except (NodeDown, Rejected):
-            return None
-        if input_fingerprint(arrays["h"], arrays["g"]) != want:
-            return None
-        grads, _ = slice_backward(self.params, arrays["h"], arrays["g"])
-        return clip(grads, self.C)
+        rnd = self.chain.state.round
+        sources = [(agent, "contrib_data", {"round": rnd, "piece": self.piece})]
+        if self.peer_relay:
+            sources += [(p, "get_contrib", {"round": rnd, "agent": agent}) for p in self.peers_of_piece()]
+        for addr, kind, meta in sources:
+            try:
+                _, arrays, _ = self.net.call(self, addr, kind, meta)
+            except (NodeDown, Rejected):
+                continue
+            if "h" not in arrays or input_fingerprint(arrays["h"], arrays["g"]) != want:
+                continue
+            grads, _ = slice_backward(self.params, arrays["h"], arrays["g"])
+            with self.lock:
+                self.contribs[agent] = (want, clip(grads, self.C), arrays["h"], arrays["g"])
+            return self.contribs[agent][1]
+        return None
+
+    def _missing_salts(self, commits):
+        """Get committed salts I was not sent from other replicas (checked against the on-chain hash)."""
+        with self.lock:
+            missing = [a for a in commits if a not in self.salts]
+        for a in missing:
+            for peer in self.peers_of_piece():
+                if peer == a:
+                    continue
+                try:
+                    meta, _, _ = self.net.call(self, peer, "get_salt", {"round": self.chain.state.round, "of": a})
+                except (NodeDown, Rejected):
+                    continue
+                salt = str(meta.get("salt", ""))
+                if sha(salt) == commits[a]:
+                    with self.lock:
+                        self.salts[a] = salt
+                    break
 
     def phase_candidate(self):
         if not self.active or not self.online:
@@ -94,6 +126,8 @@ class SliceServer(PieceMember):
         if n == 0:
             return
         commits = st.cur["commits"].get(self.piece, {})
+        if self.peer_relay and self.sigma > 0:
+            self._missing_salts(commits)
         with self.lock:
             salts = sorted((a, s) for a, s in self.salts.items() if commits.get(a) == sha(s))
         seed = int(sha(st.round, self.piece, *[a + s for a, s in salts])[:16], 16)
@@ -112,6 +146,17 @@ class SliceServer(PieceMember):
 
     def _handle(self, kind, sender, meta, arrays):
         st = self.chain.state
+        if kind in ("get_contrib", "get_salt"):          # relay for replicas that were left out
+            if sender not in st.members(self.piece) or meta["round"] != st.round:
+                raise Rejected("not a holder of this piece")
+            if kind == "get_salt":
+                if meta["of"] not in self.salts:
+                    raise Rejected("don't have it")
+                return {"salt": self.salts[meta["of"]]}, {}, 1.0
+            c = self.contribs.get(meta["agent"])
+            if not c:
+                raise Rejected("don't have it")
+            return {}, {"h": c[2], "g": c[3]}, 1.0
         if kind == "salt":
             if sender not in st.members(self.piece) or meta["round"] != st.round:
                 raise Rejected("not a holder of this piece")
@@ -142,7 +187,7 @@ class SliceServer(PieceMember):
                 prev = self.contribs.get(sender)
                 if prev and prev[0] != inp:               # keeps each agent's influence bounded (privacy)
                     raise Rejected("one training contribution per agent per round")
-                self.contribs[sender] = (inp, clip(grads, self.C))
+                self.contribs[sender] = (inp, clip(grads, self.C), h, g)
             g_in = self._maybe_lie(g_in)
             ms = 2 + 2 * self.compute_ms_per_item * len(h)
             return {"receipt": self.receipt("bwd", meta["version"], inp, g_in)}, {"out": g_in}, ms
