@@ -119,7 +119,7 @@ class Playground(unittest.TestCase):
         code, m, _ = call(self.port, "GET", "/api/map")
         self.assertEqual(code, 200)
         self.assertEqual(len(m["classes"]), app.MAP_SIZE ** 2)
-        self.assertTrue(set(m["classes"]) <= {0, 1, 2, 3})
+        self.assertLessEqual(set(m["classes"]), {0, 1, 2, 3})
 
     def test_bad_requests_are_refused_cleanly(self):
         for body in ({}, {"point": [1]}, {"point": ["a", "b"]}, {"point": [1e9, 0]}, [], "x", {"image": [1] * 784},

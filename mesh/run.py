@@ -165,6 +165,7 @@ def run_member(d, genesis, nd, ident, rounds=None, ui_port=None, trust_proxy=Fal
 
     spec = Spec(**genesis["spec"])
     chain = RemoteChain(genesis)
+    Xtest = ytest = None                         # only agents hold test data
     common = dict(lr=genesis.get("lr", 0.5), clip_norm=CLIP, dp_sigma=0.0, behaviour=nd.get("behaviour", "honest"),
                   seed=abs(hash(name)) % 2 ** 31)
     if nd["role"] == "server":

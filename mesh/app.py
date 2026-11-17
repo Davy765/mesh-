@@ -21,7 +21,7 @@ import numpy as np
 
 from .model import head
 from .network import NodeDown, Rejected
-from .testnet import _client_ip, _web_server
+from .webutil import _client_ip, _web_server
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 MAX_BODY = 64 * 1024
