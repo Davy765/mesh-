@@ -52,3 +52,28 @@ jobs:
           grep -q "server0.1 after its restart: .*resynced=True" out.txt
           grep -Eq "training rounds: [0-9]+, accepted [1-9]" out.txt
 
+  cluster-rehearsal:
+    # The multi-machine code path (per-machine keys, card exchange through machine 0, cross-machine report),
+    # with three "machines" on one runner. The real thing runs in the multi-machine workflow.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Three machines, one runner
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+        run: |
+          for m in 0 1 2; do
+            timeout 600 python -m mesh.run cluster --machine $m --machines 3 --my-host 127.0.0.1 \
+              --coordinator 127.0.0.1:9000 --rounds 10 --interval 1.5 --dir net-m$m > m$m.out 2>&1 &
+          done
+          wait
+          cat m0.out m1.out m2.out
+          for m in 0 1 2; do grep -q "machine $m: node errors logged: 0" m$m.out; done
+          grep -q "honest servers outvoted: none" m0.out
+          grep -Eq "training rounds: [0-9]+, accepted [1-9]" m0.out
+

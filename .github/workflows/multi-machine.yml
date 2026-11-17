@@ -1,0 +1,91 @@
+name: multi-machine
+
+# Runs Mesh across three separate GitHub machines. They can't reach each other on their own, so each one
+# joins a private Tailscale network first. Start it from the Actions tab: "multi-machine" -> "Run workflow".
+# Needs a repository secret TS_AUTHKEY: a reusable, ephemeral Tailscale auth key (see README).
+
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: "Training rounds"
+        default: "30"
+      carrier:
+        description: "How nodes talk"
+        type: choice
+        options: [tcp, http]
+        default: tcp
+
+permissions:
+  contents: read
+
+concurrency:
+  group: multi-machine
+  cancel-in-progress: false
+
+jobs:
+  machine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: [0, 1, 2]
+    env:
+      RUN_TAG: ${{ github.run_id }}-${{ github.run_attempt }}
+      ROUNDS: ${{ inputs.rounds }}
+      CARRIER: ${{ inputs.carrier }}
+    steps:
+      - name: Check the Tailscale key is set
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          if [ -z "$TS_AUTHKEY" ]; then
+            echo "::error::Add a repository secret named TS_AUTHKEY (a reusable, ephemeral Tailscale auth key). See the README."
+            exit 1
+          fi
+          case "$ROUNDS" in ''|*[!0-9]*) echo "::error::rounds must be a whole number"; exit 1;; esac
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Join the private network
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: mesh-${{ matrix.machine }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Find this machine and machine 0
+        run: |
+          echo "MY_IP=$(tailscale ip -4)" >> "$GITHUB_ENV"
+          ip=""
+          for i in $(seq 1 60); do
+            ip=$(tailscale ip -4 "mesh-0-$RUN_TAG" 2>/dev/null) && [ -n "$ip" ] && break
+            sleep 5
+          done
+          if [ -z "$ip" ]; then echo "::error::machine 0 never joined the private network"; exit 1; fi
+          echo "COORD_IP=$ip" >> "$GITHUB_ENV"
+
+      - name: Run this machine's share of the network
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+        run: |
+          extra=""
+          if [ "$CARRIER" = "http" ]; then extra="--http"; fi
+          python -m mesh.run cluster --machine ${{ matrix.machine }} --machines 3 \
+            --my-host "$MY_IP" --coordinator "$COORD_IP:9000" \
+            --rounds "$ROUNDS" --interval 2 --dir net $extra
+
+      - name: Keep the node logs (never the keys)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-machine-${{ matrix.machine }}
+          path: net/logs/
+          retention-days: 7
+          if-no-files-found: ignore

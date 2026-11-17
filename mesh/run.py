@@ -43,7 +43,7 @@ def log(name, **kw):
 # Each machine runs `keygen` for its own nodes: the private key stays in a local file, and only a public
 # "card" (name, role, endpoint, public keys) is shared. `genesis` builds the network config from cards alone.
 PUBLIC_CARD_FIELDS = ("name", "role", "piece", "index", "behaviour", "endpoint", "listen", "address", "sign_pk",
-                      "kex_pk")
+                      "kex_pk", "machine", "cpu")
 
 
 def keygen(keys_dir, name, role, endpoint, piece=None, index=None, behaviour="honest", listen=None):
@@ -275,6 +275,188 @@ def local(rounds, interval, attackers, base_port, d, dataset="ring", http=False)
     _restart_summary(d)
 
 
+# ---------------------------------------------------------------- several machines
+def _cpu_model():
+    try:
+        for line in open("/proc/cpuinfo"):
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    import platform
+    return platform.processor() or platform.machine()
+
+
+def _rendezvous_server(port, expected, d, interval, rounds, dataset):
+    """Machine 0 collects every machine's public cards, builds genesis once all have arrived, and hands it out.
+    Only public data passes through here; private keys stay on the machine that made them."""
+    import http.server
+    box = {"cards": {}, "config": None}
+    lock = threading.Lock()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            cards = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+            with lock:
+                for c in cards:
+                    box["cards"][c["name"]] = c
+                _maybe_build()
+            self._send(200, {"ok": True})
+
+        def do_GET(self):
+            with lock:
+                cfg = box["config"]
+            self._send(200, cfg) if cfg else self._send(404, {"waiting_for": expected - len(box["cards"])})
+
+    def _maybe_build():
+        if box["config"] is None and len(box["cards"]) == expected:
+            genesis, nodes = build_genesis(d, list(box["cards"].values()), interval=interval, rounds=rounds,
+                                           dataset=dataset)
+            box["config"] = {"genesis": genesis, "nodes": nodes}
+
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", port), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, box, lock, _maybe_build
+
+
+def _http_json(method, url, obj=None, timeout=10):
+    import urllib.request
+    req = urllib.request.Request(url, method=method, data=json.dumps(obj).encode() if obj is not None else None)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # the tailnet, never a web proxy
+    with opener.open(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def cluster(machine, machines, my_host, coordinator, rounds, interval, d, attackers=True, http=False,
+            port_base=9100, rendezvous_port=9000, dataset="ring"):
+    """Run this machine's share of a multi-machine network. Node j of the demo layout runs on machine
+    j % machines. Machine 0 also gathers the public cards and builds genesis."""
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(os.path.join(d, "logs"))
+    layout = demo_layout(attackers=attackers)
+    cpu = _cpu_model()
+    cards = []
+    for j, nd in enumerate(layout):
+        if j % machines != machine:
+            continue
+        addr = f"{my_host}:{port_base + j}"
+        c = keygen(os.path.join(d, "keys"), nd["name"], nd["role"], f"http://{addr}" if http else addr,
+                   piece=nd.get("piece"), index=nd.get("index"), behaviour=nd["behaviour"],
+                   listen=f"0.0.0.0:{port_base + j}")
+        c["machine"], c["cpu"] = machine, cpu
+        cards.append(c)
+    print(f"machine {machine} ({cpu}) at {my_host}: running {', '.join(c['name'] for c in cards)}", flush=True)
+
+    deadline = time.time() + 900
+    if machine == 0:
+        srv, box, lock, maybe_build = _rendezvous_server(rendezvous_port, len(layout), d, interval, rounds, dataset)
+        with lock:
+            for c in cards:
+                box["cards"][c["name"]] = c
+            maybe_build()
+        while box["config"] is None:
+            if time.time() > deadline:
+                raise SystemExit(f"only {len(box['cards'])}/{len(layout)} cards arrived")
+            time.sleep(1)
+        config = box["config"]
+    else:
+        base = f"http://{coordinator}"
+        while True:
+            try:
+                _http_json("POST", base + "/cards", cards)
+                break
+            except OSError:
+                if time.time() > deadline:
+                    raise SystemExit(f"could not reach machine 0 at {coordinator}")
+                time.sleep(2)
+        while True:
+            try:
+                config = _http_json("GET", base + "/genesis")
+                break
+            except OSError:                              # 404 until every machine has sent its cards
+                if time.time() > deadline:
+                    raise SystemExit("machine 0 never published the network config")
+                time.sleep(2)
+        json.dump(config["genesis"], open(os.path.join(d, "genesis.json"), "w"), indent=1)
+        json.dump(config["nodes"], open(os.path.join(d, "nodes.json"), "w"), indent=1)
+    genesis, nodes = config["genesis"], config["nodes"]
+    print(f"network config agreed: {len(nodes)} nodes on {len({n['machine'] for n in nodes})} machines", flush=True)
+
+    procs = {}
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    mine = [n for n in nodes if n["machine"] == machine]
+    for group in (("validator",), ("server", "agent")):
+        for nd in mine:
+            if nd["role"] in group:
+                f = open(os.path.join(d, "logs", nd["name"] + ".log"), "a")
+                procs[nd["name"]] = subprocess.Popen(
+                    [sys.executable, "-m", "mesh.run", "node", "--dir", d, "--name", nd["name"],
+                     "--rounds", str(rounds)], stdout=f, stderr=subprocess.STDOUT, cwd=root)
+        time.sleep(1.0)
+
+    chain = RemoteChain(genesis)
+    t0, last = time.time(), None
+    try:
+        while True:
+            time.sleep(1)
+            st = chain.state
+            for e in _read(d, "agent0", "eval"):
+                if last is None or e["round"] > last:
+                    last = e["round"]
+                    print(f"  round {last:3d}: test accuracy {e['test_acc']:.1%}", flush=True)
+            if st.round >= rounds + 3 or time.time() - t0 > rounds * interval * 6 + 300:
+                break
+        if machine == 0:
+            _ledger_summary(chain)
+            _cross_machine_summary(chain, nodes)
+        else:
+            time.sleep(30)                               # let machine 0 read the ledger before validators stop
+    finally:
+        for p in procs.values():
+            if p.poll() is None:
+                p.send_signal(signal.SIGTERM)
+        time.sleep(1)
+        for p in procs.values():
+            if p.poll() is None:
+                p.kill()
+        if machine == 0:
+            srv.shutdown()
+    errors = [r for nd in mine for r in _read(d, nd["name"], "error")]
+    print(f"machine {machine}: node errors logged: {len(errors)}"
+          + (f" (first: {errors[0]['name']}: {errors[0]['error']})" if errors else ""), flush=True)
+    return 0 if not errors else 1
+
+
+def _cross_machine_summary(chain, nodes):
+    st = chain.state
+    by_addr = {n["address"]: n for n in nodes}
+    honest_servers = {n["address"] for n in nodes if n["role"] == "server" and n["behaviour"] == "honest"}
+    outvoted = {}
+    for h in st.history:
+        for piece, addrs in h["trimmed"].items():
+            if piece != "ends":
+                for a in set(addrs) & honest_servers:
+                    outvoted[by_addr[a]["name"]] = outvoted.get(by_addr[a]["name"], 0) + 1
+    print("\n== Across machines ==")
+    for piece in sorted({n["piece"] for n in nodes if n["role"] == "server"}):
+        reps = [n for n in nodes if n.get("piece") == piece]
+        print(f"  {piece}: " + "; ".join(f"{n['name']} on machine {n['machine']} ({n['cpu']})" for n in reps))
+    cpus = {n["cpu"] for n in nodes if n["address"] in honest_servers}
+    print(f"  honest servers outvoted: {outvoted or 'none'}"
+          + (f" (honest replicas ran on {len(cpus)} different CPU models)" if len(cpus) > 1 else
+             " (all honest replicas had the same CPU model, so this says nothing about mixed hardware)"))
+
+
 def _restart_summary(d):
     for name in ("validator3", "server0.1"):
         starts = _read(d, name, "started") + _read(d, name, "rejoining")
@@ -374,6 +556,19 @@ def main():
     g.add_argument("--interval", type=float, default=2.0)
     g.add_argument("--dataset", choices=["ring", "mnist"], default="ring")
     g.add_argument("--rounds", type=int, default=None)
+    m = sub.add_parser("cluster", help="run this machine's share of a multi-machine network")
+    m.add_argument("--machine", type=int, required=True)
+    m.add_argument("--machines", type=int, required=True)
+    m.add_argument("--my-host", required=True, help="address the other machines reach this one at")
+    m.add_argument("--coordinator", required=True, help="host:port of machine 0's card exchange")
+    m.add_argument("--rounds", type=int, default=30)
+    m.add_argument("--interval", type=float, default=2.0)
+    m.add_argument("--dir", default="net-cluster")
+    m.add_argument("--port", type=int, default=9100)
+    m.add_argument("--rendezvous-port", type=int, default=9000)
+    m.add_argument("--http", action="store_true")
+    m.add_argument("--no-attackers", action="store_true")
+    m.add_argument("--dataset", choices=["ring", "mnist"], default="ring")
     args = ap.parse_args()
     if args.cmd == "local":
         local(args.rounds, args.interval, not args.no_attackers, args.port, args.dir, args.dataset, http=args.http)
@@ -381,6 +576,10 @@ def main():
         init(args.dir, host=args.host, base_port=args.port, interval=args.interval, attackers=not args.no_attackers,
              dataset=args.dataset, rounds=args.rounds)
         print(f"wrote {args.dir}/genesis.json and {args.dir}/nodes.json")
+    elif args.cmd == "cluster":
+        sys.exit(cluster(args.machine, args.machines, args.my_host, args.coordinator, args.rounds, args.interval,
+                         args.dir, attackers=not args.no_attackers, http=args.http, port_base=args.port,
+                         rendezvous_port=args.rendezvous_port, dataset=args.dataset))
     elif args.cmd == "keygen":
         if args.role == "server" and not args.piece or args.role == "agent" and args.index is None:
             raise SystemExit("servers need --piece, agents need --index")

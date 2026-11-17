@@ -124,6 +124,27 @@ In a 24-round run, accuracy reached 94.3%, the restarted validator caught up to 
 others, the restarted server resynced and earned rewards again, and no node errors were logged. GitHub runs a
 shorter version of this, over TCP and HTTP, on every pull request.
 
+### Running on several real machines (GitHub + Tailscale)
+
+The `multi-machine` workflow starts three separate GitHub machines, joins them into a private
+[Tailscale](https://tailscale.com) network, and runs the whole system across them. Each machine creates its own
+keys; machine 0 collects only the public cards and hands out the network config. Each slice's three servers land on
+three different machines, and the report shows which CPU each one ran on, plus whether any honest server was
+outvoted (a real-hardware check for [#6](https://github.com/Davy765/mesh-/issues/6)).
+
+One-time setup:
+1. Create a free Tailscale account.
+2. In the Tailscale admin console, go to **Settings → Keys → Generate auth key**. Turn on **Reusable** and
+   **Ephemeral** (so the machines disappear from your network when a run ends), then generate and copy the key.
+3. In this repo, go to **Settings → Secrets and variables → Actions → New repository secret**. Name it
+   `TS_AUTHKEY` and paste the key.
+
+Then **Actions → multi-machine → Run workflow**. A 30-round run takes about 5 minutes. Each machine's node logs are
+kept as artifacts for 7 days; private keys are never uploaded.
+
+`python -m mesh.run cluster` is what each machine runs; it also works on your own computers (`--my-host` is the
+address the others reach this machine at, `--coordinator` is machine 0's address and port 9000).
+
 ### Not built yet
 
 - **Validators joining or leaving** (the set is fixed at genesis) and a full BFT protocol instead of
@@ -132,7 +153,7 @@ shorter version of this, over TCP and HTTP, on every pull request.
   undetected. More replicas per slice raise the bar but cost more computing.
 - **Hiding who talks to whom.** Traffic is encrypted, but its size and pattern are visible.
 - **Large models and GPUs.** The biggest tested model has 2 million parameters, in plain NumPy.
-- **Running across physically separate machines.** Supported (keygen, HTTPS), but not yet done.
+- **A run across physically separate machines** is set up (the `multi-machine` workflow) but hasn't been run yet.
 
 ### Code map
 
