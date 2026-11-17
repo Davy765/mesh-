@@ -4,13 +4,16 @@ import os
 import random
 import sys
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mesh.chain import make_tx  # noqa: E402
 from mesh.crypto import Identity, canon  # noqa: E402
+import mesh.network as net  # noqa: E402
 from mesh.network import Rejected  # noqa: E402
 from mesh.sim import World  # noqa: E402
 
@@ -47,7 +50,6 @@ class MalformedMessages(unittest.TestCase):
                         self.assertEqual(rkind, "error", (kind, m, i))
 
     def test_stale_messages_are_refused(self):
-        import mesh.network as net
         server, agent = self.w.servers[(0, 0)], self.w.agents[0]
         env = agent.seal(server.address, "fwd", {"version": server.version}, {"h": np.zeros((1, 32))})
         old, net.REPLAY_WINDOW_S = net.REPLAY_WINDOW_S, -1          # everything counts as stale
@@ -139,7 +141,6 @@ class WebServices(unittest.TestCase):
         f.chain.state.balances[f.id.address] = 10 ** 6
         f.amount, f.per_ip, f.per_day = 100, 2, per_day
         f.given, f.ip_log, f.day_log = set(), {}, []
-        import threading
         f.lock, f.nonce, f.last_submit = threading.Lock(), 0, 0.0
         return f
 
@@ -159,7 +160,6 @@ class WebServices(unittest.TestCase):
         import http.client
         import json as _json
         import socket
-        from unittest import mock
         from mesh import testnet
 
         with tempfile.TemporaryDirectory() as d:
@@ -172,7 +172,6 @@ class WebServices(unittest.TestCase):
         with mock.patch.object(testnet, "RemoteChain", lambda g, ttl=2.0: type("C", (), {
                 "state": property(lambda self: w.chain.state), "endpoints": [1, 2, 3, 4], "f": 1})()):
             srv = testnet.serve_status(genesis, port, host="127.0.0.1")
-        import threading
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
             for path in ("/", "/api/status", "/genesis.json"):

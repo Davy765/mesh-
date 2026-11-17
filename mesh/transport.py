@@ -284,7 +284,7 @@ def serve(peer, host, port, public_handler=None, http_mode=False):
                     if reply is not None:                  # busy: close without a reply; the caller retries
                         send_frame(self.request, kind, reply)
                 except (OSError, ConnectionError, struct.error):
-                    pass
+                    return      # the client went away or sent a broken frame: nothing to answer
 
         class Server(_LimitedServerMixin, socketserver.ThreadingTCPServer):
             daemon_threads = True
