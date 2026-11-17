@@ -83,7 +83,7 @@ jobs:
 
       - name: Keep the node logs (never the keys)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: logs-machine-${{ matrix.machine }}
           path: net/logs/
